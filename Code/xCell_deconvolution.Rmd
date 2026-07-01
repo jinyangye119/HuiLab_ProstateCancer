@@ -1,0 +1,651 @@
+---
+title: "xCell2 Custom Prostate Reference"
+output: html_document
+date: "2026-04-20"
+editor_options:
+  chunk_output_type: console
+---
+
+## Goal
+
+This notebook builds a custom xCell2 reference from `dge_combined_annotated.rds`.
+
+The input object is a Seurat single-cell object. To make a stable custom reference for bulk RNA-seq deconvolution, this workflow creates pseudo-bulk reference profiles by averaging expression within each `refinedID` cell type and each source sample/dataset.
+
+Reference single-cell: https://www.nature.com/articles/s41467-021-27322-4
+
+## Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(Matrix)
+  library(Seurat)
+  library(xCell2)
+  library(biomaRt)
+  library(BiocParallel)
+})
+
+cfg <- list(
+  seurat_rds = "/Users/YUC199/Library/CloudStorage/OneDrive-JohnsHopkins/Personal_data/Post-doc/Qian Lab JHU/Zhang Hui Lab/Hongyi/raw/dge_combined_annotated.rds",
+  output_dir = "/Users/YUC199/Library/CloudStorage/OneDrive-JohnsHopkins/Personal_data/Post-doc/Qian Lab JHU/Zhang Hui Lab/Hongyi/raw/xCell2_custom_reference_tpm",
+  assay = "RNA",
+  expression_slot = "counts",
+  celltype_col = "refinedID",
+  dataset_col = "orig.ident",
+  min_cells_per_pseudobulk = 20,
+  min_pseudobulk_profiles_per_label = 2,
+  gene_length_source = "Ensembl BioMart hsapiens_gene_ensembl transcript_length",
+  train_ref_type = "rnaseq",
+  use_ontology = TRUE,
+  use_spillover = TRUE,
+  spillover_alpha = 0.5,
+  seed = 123,
+  workers = 2
+)
+
+merge_reference_label <- function(x) {
+  x <- gsub("_", "-", as.character(x))
+  x[x %in% c("CD4-cluster1", "CD4-cluster2","CD8-cluster2","CD8-cluster3")] <- "T cell"
+  x[x %in% c("NK-cell-cluster1", "NKcell-cluster2")] <- "T cell"
+  x[x %in% c("Myeloid", "Proliferating Myeloid")] <- "T cell"
+  x[x %in% c("CD14- Monocyte", "CD14+ Monocyte")] <- "Monocyte"
+  x[x %in% c("M2-Macrophage", "M0-Macrophage")] <- "Macrophage"
+  x
+}
+
+fetch_ensembl_gene_lengths <- function(genes, cache_file) {
+  if (file.exists(cache_file)) {
+    length_table <- fread(cache_file)
+  } else {
+    message("Fetching gene lengths from Ensembl BioMart. This is cached after the first run.")
+    mart <- biomaRt::useEnsembl(
+      biomart = "genes",
+      dataset = "hsapiens_gene_ensembl",
+      mirror = "useast"
+    )
+    gene_chunks <- split(unique(genes), ceiling(seq_along(unique(genes)) / 500))
+    bm_list <- lapply(gene_chunks, function(gene_chunk) {
+      biomaRt::getBM(
+        attributes = c("hgnc_symbol", "ensembl_gene_id", "transcript_length"),
+        filters = "hgnc_symbol",
+        values = gene_chunk,
+        mart = mart
+      )
+    })
+    bm <- rbindlist(lapply(bm_list, as.data.table), fill = TRUE)
+    length_table <- bm[
+      !is.na(hgnc_symbol) & hgnc_symbol != "" &
+        !is.na(transcript_length) & transcript_length > 0,
+      .(gene_length_bp = max(transcript_length, na.rm = TRUE)),
+      by = hgnc_symbol
+    ]
+    fwrite(length_table, cache_file, sep = "\t")
+  }
+  length_table
+}
+
+counts_to_tpm <- function(count_matrix, gene_length_bp) {
+  gene_length_kb <- gene_length_bp / 1000
+  rpk <- sweep(count_matrix, 1, gene_length_kb, "/")
+  scaling_factor <- colSums(rpk, na.rm = TRUE) / 1e6
+  sweep(rpk, 2, scaling_factor, "/")
+}
+
+dir.create(cfg$output_dir, recursive = TRUE, showWarnings = FALSE)
+set.seed(cfg$seed)
+```
+
+## Load Seurat Reference
+
+```{r load-reference}
+ref_seurat <- readRDS(cfg$seurat_rds)
+View(ref_seurat@meta.data)
+stopifnot(inherits(ref_seurat, "Seurat"))
+stopifnot(cfg$assay %in% names(ref_seurat@assays))
+stopifnot(all(c(cfg$celltype_col, cfg$dataset_col) %in% colnames(ref_seurat@meta.data)))
+
+Idents(ref_seurat) <- merge_reference_label(ref_seurat[[cfg$celltype_col, drop = TRUE]])
+#Idents(ref_seurat) <- cfg$celltype_col
+
+celltype_counts <- sort(table(merge_reference_label(ref_seurat[[cfg$celltype_col, drop = TRUE]])), decreasing = TRUE)
+write.table(
+  data.frame(label = names(celltype_counts), n_cells = as.integer(celltype_counts)),
+  file = file.path(cfg$output_dir, "celltype_cell_counts.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+celltype_counts
+```
+
+## Build Pseudo-bulk Expression Matrix
+
+For each `refinedID` x `orig.ident` group with at least `min_cells_per_pseudobulk` cells, raw counts are summed across cells to create pseudo-bulk profiles. Gene lengths are fetched from Ensembl BioMart and cached locally. Pseudo-bulk counts are then converted to TPM and transformed to `log1p(TPM)` for xCell2 training.
+
+```{r build-pseudobulk}
+expr_counts <- GetAssayData(ref_seurat, assay = cfg$assay, slot = cfg$expression_slot)
+meta <- ref_seurat@meta.data
+meta$cell_barcode <- rownames(meta)
+meta$label_raw <- as.character(meta[[cfg$celltype_col]])
+meta$dataset_raw <- as.character(meta[[cfg$dataset_col]])
+
+meta$label <- merge_reference_label(meta$label_raw)
+meta$dataset <- meta$dataset_raw
+meta$pseudobulk_id <- paste(meta$label, meta$dataset, sep = "__")
+
+group_counts <- as.data.table(meta)[
+  ,
+  .(n_cells = .N),
+  by = .(label, dataset, pseudobulk_id)
+]
+group_counts <- group_counts[n_cells >= cfg$min_cells_per_pseudobulk]
+
+label_profile_counts <- group_counts[, .(n_profiles = .N, total_cells = sum(n_cells)), by = label]
+keep_labels <- label_profile_counts[n_profiles >= cfg$min_pseudobulk_profiles_per_label, label]
+group_counts <- group_counts[label %in% keep_labels]
+
+write.table(
+  group_counts[order(label, dataset)],
+  file = file.path(cfg$output_dir, "pseudobulk_groups_used.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+write.table(
+  label_profile_counts[order(label)],
+  file = file.path(cfg$output_dir, "label_pseudobulk_profile_counts.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+message("Pseudo-bulk groups retained: ", nrow(group_counts))
+message("Labels retained: ", length(unique(group_counts$label)))
+
+pseudobulk_list <- vector("list", nrow(group_counts))
+for (i in seq_len(nrow(group_counts))) {
+  group_id <- group_counts$pseudobulk_id[i]
+  cells <- rownames(meta)[meta$pseudobulk_id == group_id]
+  pseudobulk_list[[i]] <- Matrix::rowSums(expr_counts[, cells, drop = FALSE])
+}
+
+pseudobulk_counts <- do.call(cbind, pseudobulk_list)
+colnames(pseudobulk_counts) <- make.unique(group_counts$pseudobulk_id)
+rownames(pseudobulk_counts) <- rownames(expr_counts)
+pseudobulk_counts <- as.matrix(pseudobulk_counts)
+
+gene_length_cache <- file.path(cfg$output_dir, "ensembl_gene_lengths_by_hgnc_symbol.tsv")
+gene_lengths <- fetch_ensembl_gene_lengths(rownames(pseudobulk_counts), gene_length_cache)
+matched_length <- gene_lengths$gene_length_bp[match(rownames(pseudobulk_counts), gene_lengths$hgnc_symbol)]
+has_length <- !is.na(matched_length) & matched_length > 0
+
+write.table(
+  data.frame(
+    gene = rownames(pseudobulk_counts),
+    has_ensembl_length = has_length,
+    gene_length_bp = matched_length
+  ),
+  file = file.path(cfg$output_dir, "gene_length_match_summary.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+message("Genes with Ensembl length: ", sum(has_length), " / ", length(has_length))
+
+pseudobulk_counts <- pseudobulk_counts[has_length, , drop = FALSE]
+matched_length <- matched_length[has_length]
+
+ref_matrix_tpm <- counts_to_tpm(pseudobulk_counts, matched_length)
+ref_matrix <- log1p(ref_matrix_tpm)
+
+keep_genes <- rowSums(is.finite(ref_matrix)) == ncol(ref_matrix) & matrixStats::rowVars(ref_matrix) > 0
+ref_matrix <- ref_matrix[keep_genes, , drop = FALSE]
+ref_matrix_tpm <- ref_matrix_tpm[rownames(ref_matrix), , drop = FALSE]
+
+saveRDS(
+  ref_matrix,
+  file = file.path(cfg$output_dir, "prostate_xcell2_pseudobulk_log1p_tpm_matrix.rds")
+)
+saveRDS(
+  ref_matrix_tpm,
+  file = file.path(cfg$output_dir, "prostate_xcell2_pseudobulk_tpm_matrix.rds")
+)
+fwrite(
+  data.table(gene = rownames(ref_matrix), as.data.frame(ref_matrix, check.names = FALSE)),
+  file = file.path(cfg$output_dir, "prostate_xcell2_pseudobulk_log1p_tpm_matrix.tsv"),
+  sep = "\t"
+)
+fwrite(
+  data.table(gene = rownames(ref_matrix_tpm), as.data.frame(ref_matrix_tpm, check.names = FALSE)),
+  file = file.path(cfg$output_dir, "prostate_xcell2_pseudobulk_tpm_matrix.tsv"),
+  sep = "\t"
+)
+
+dim(ref_matrix)
+```
+
+## Build xCell2 Labels
+
+The xCell2 labels table must include:
+
+- `ont`: Cell ontology ID, or `NA` when not assigned.
+- `label`: Cell type name.
+- `sample`: Column name in the reference matrix.
+- `dataset`: Source sample/dataset.
+
+Ontology IDs are assigned only where the mapping is clear. Prostate cancer epithelial labels are intentionally left as `NA` because they are disease-state labels rather than standard normal cell ontology classes.
+
+```{r labels}
+
+group_counts$label%>%unique()
+ontology_map <- c(
+  "B-cell" = "CL:0000236",
+  "Plasma" = "CL:0000786",
+  "T-cell" = "CL:0000084",
+  "CD8 T cell" = "CL:0000625",
+  "CD4 T cell" = "CL:0000624",
+  "Treg" = "CL:0000815",
+  "NK-cell-cluster1" = "CL:0000623",
+  "NKcell-cluster2" = "CL:0000623",
+  "CD14+ Monocyte" = "CL:0001054",
+  "CD14- Monocyte" = "CL:0000875",
+  "M0-Macrophage" = "CL:0000235",
+  "M1-Macrophage" = "CL:0000235",
+  "M2-Macrophage" = "CL:0000235",
+  "Myeloid" = "CL:0000763",
+  "Proliferating Myeloid" = "CL:0000763",
+  "Neutrophils" = "CL:0000775",
+  "Eosinophils" = "CL:0000771",
+  "Mast" = "CL:0000097",
+  "Endothelial" = "CL:0000115",
+  "Fibroblast" = "CL:0000057",
+  "Smooth-muscle" = "CL:0000192",
+  "Normal prostate epithelial" = "CL:0000066",
+  "Club" = "CL:0000158"
+)
+
+labels <- data.frame(
+  ont = unname(ontology_map[group_counts$label]),
+  label = group_counts$label,
+  sample = colnames(ref_matrix),
+  dataset = group_counts$dataset,
+  n_cells = group_counts$n_cells,
+  stringsAsFactors = FALSE
+)
+labels$ont[is.na(labels$ont)] <- NA_character_
+
+stopifnot(identical(labels$sample, colnames(ref_matrix)))
+stopifnot(all(c("ont", "label", "sample", "dataset") %in% colnames(labels)))
+
+write.table(
+  labels,
+  file = file.path(cfg$output_dir, "prostate_xcell2_reference_labels.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+table(labels$label)
+```
+
+## Optional Lineage File
+
+This creates a lineage dependency file from available Cell Ontology IDs. You can inspect and manually edit the TSV before training if needed. Labels with `NA` ontology will be retained, but they will not contribute ontology relationships.
+
+```{r lineage}
+lineage_file <- file.path(cfg$output_dir, "prostate_xcell2_lineage_dependencies.tsv")
+lineage_result <- tryCatch(
+  xCell2GetLineage(labels = labels[, c("ont", "label", "sample", "dataset")], outFile = lineage_file),
+  error = function(e) {
+    message("Lineage generation failed; training will continue without lineage file: ", conditionMessage(e))
+    NULL
+  }
+)
+
+if (file.exists(lineage_file)) {
+  lineage_file
+} else {
+  NA_character_
+}
+```
+
+## Train xCell2 Custom Reference
+
+```{r train-xcell2-reference}
+parallel_param <- if (.Platform$OS.type == "unix" && cfg$workers > 1) {
+  BiocParallel::MulticoreParam(workers = cfg$workers)
+} else {
+  BiocParallel::SerialParam()
+}
+
+set.seed(cfg$seed)
+
+lineage_arg <- if (file.exists(lineage_file)) lineage_file else NULL
+
+prostate_xcell2_ref <- xCell2Train(
+  ref = ref_matrix,
+  labels = labels[, c("ont", "label", "sample", "dataset")],
+  refType = cfg$train_ref_type,
+  useOntology = cfg$use_ontology,
+  lineageFile = lineage_arg,
+  BPPARAM = parallel_param,
+  useSpillover = cfg$use_spillover,
+  spilloverAlpha = cfg$spillover_alpha
+)
+
+saveRDS(
+  prostate_xcell2_ref,
+  file = file.path(cfg$output_dir, "prostate_custom_xCell2_reference.rds")
+)
+
+prostate_xcell2_ref
+```
+
+## Save Summary
+
+```{r summary}
+summary_lines <- c(
+  "# xCell2 Custom Prostate Reference",
+  "",
+  paste("Input Seurat object:", cfg$seurat_rds),
+  paste("Output directory:", cfg$output_dir),
+  paste("Normalization:", "pseudo-bulk raw counts converted to TPM, then log1p(TPM) for xCell2Train"),
+  paste("Gene length source:", cfg$gene_length_source),
+  paste("Expression matrix dimensions:", paste(dim(ref_matrix), collapse = " x ")),
+  paste("Pseudo-bulk profiles:", ncol(ref_matrix)),
+  paste("Cell type labels:", length(unique(labels$label))),
+  paste("Reference object:", file.path(cfg$output_dir, "prostate_custom_xCell2_reference.rds")),
+  paste("Labels table:", file.path(cfg$output_dir, "prostate_xcell2_reference_labels.tsv")),
+  paste("Expression matrix RDS:", file.path(cfg$output_dir, "prostate_xcell2_pseudobulk_log1p_tpm_matrix.rds")),
+  paste("TPM matrix RDS:", file.path(cfg$output_dir, "prostate_xcell2_pseudobulk_tpm_matrix.rds")),
+  paste("Lineage file:", ifelse(file.exists(lineage_file), lineage_file, "not generated")),
+  "",
+  "## Cell Type Counts",
+  capture.output(print(table(labels$label)))
+)
+
+writeLines(summary_lines, file.path(cfg$output_dir, "README_xCell2_reference.md"))
+
+sessionInfo()
+```
+
+
+
+
+## xcell
+Raw enrichment scores: *RAW.txt, P-values for the significance of the scores to be different from zero: *pvals.txt.  In the manuscript we use a threshold of 0.2 to detemine a significant score. 
+
+```{r}
+#devtools::install_github('dviraran/xCell')
+#
+
+
+
+#fpkm <- fpkm %>%
+#  dplyr::filter(!is.na(gene_name.T))%>%
+#  dplyr::select(-gene_id.T, -gene_biotype.T,gene_biotype.N,gene_name.N) %>%   
+#  group_by(gene_name.T) %>%
+#  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+#  ungroup()
+
+#fpkm <- fpkm %>%
+#  column_to_rownames("gene_name.T")
+
+#write.csv(fpkm,file = "../Output/RNAseq_fpkm.csv")
+#devtools::install_github('AlmogAngel/xCell2')
+
+library(xCell2)
+library(readxl)
+library(tidyverse)
+
+tpm = read_excel("../Output/CPTAC_RNAseq_log2TPM.xlsx")%>%
+  dplyr::filter(!is.na(gene_name.T))%>%
+  dplyr::select(gene_name.T,contains("C3"),contains("CHTN"))%>% 
+  group_by(gene_name.T) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  ungroup()%>%
+  column_to_rownames("gene_name.T")%>%
+  as.matrix()
+
+levels = c("Normal","No.Tumor","Low.Purity","multifocal","Sufficient.Purity")
+
+meta = read.csv("../raw/raw/CPTAC/20_MetaData_03_12_2026.csv")
+
+meta_RNA <- meta %>%
+  filter(common_ID %in% colnames(tpm)) %>%
+  column_to_rownames("common_ID") %>%
+  mutate(condition = gsub("\\ ",".",FirstCategory)%>%
+           factor(levels = group_levels))%>%
+  dplyr::arrange(condition)
+
+prostate_xcell2_ref = read_rds("/Users/YUC199/Library/CloudStorage/OneDrive-JohnsHopkins/Personal_data/Post-doc/Qian Lab JHU/Zhang Hui Lab/Hongyi/raw/xCell2_custom_reference_tpm/prostate_custom_xCell2_reference.rds")
+xcell_res <- xCell2Analysis(
+  mix = tpm,
+  xcell2object = prostate_xcell2_ref,
+  minSharedGenes = 0.8,spilloverAlpha = 0.8,rawScores =F
+)
+
+
+xcell_long = xcell_res%>%
+  as.data.frame()%>%
+  rownames_to_column("X")%>%
+  reshape2::melt(id.vars = "X")%>%
+  left_join(meta_RNA%>%
+              rownames_to_column("variable"),by="variable")%>%
+  mutate(condition = factor(condition,levels=group_levels))%>%
+  dplyr::filter(!is.na(condition))%>%
+  mutate(Celltype=ifelse(X=="Normal prostate epithelial","Normal Epithelial","Other cells"),
+         Celltype=ifelse(X=="Tumor epithelial","Tumor Epithelial",Celltype),
+         Celltype=ifelse(X%in%c("CD14+ Monocyte","M2-Macrophage","CD4 T cell","Mast","CD8 T cell","CD14- Monocyte","Myeloid","T-cell","M0-Macrophage" ),"Immune cells",Celltype),
+         Celltype=ifelse(X%in%c("Endothelial","Fibroblast", "Club","Smooth-muscle"  ),"Stromal/Endo cells",Celltype))
+
+df1 <- xcell_long %>% 
+  group_by(X,condition) %>% 
+  summarise(med = median(value))
+
+ggplot(xcell_long%>%
+         dplyr::filter(Celltype=="Immune cells")%>%
+         dplyr::select(case_id,condition,value)%>%
+         group_by(case_id,condition)%>%
+         summarise(value=sum(value))%>%
+         ungroup()%>%
+         unique(),aes(x=condition,y=value+0.01)) +
+  #geom_violin(scale = "width",trim = T)+
+  stat_summary(fun.y = median, fun.ymin = median, fun.ymax = median,
+                 geom = "crossbar", width = 0.6)+
+  geom_dotplot(aes( fill = condition),color=NA,
+                 binaxis = "y",         # which axis to bin along
+                 binwidth = 0.01,        # Minimal difference considered diffeerent
+                 stackdir = "center"    # Centered
+                 )+
+  #geom_point(position = position_jitterdodge(0.6),size=1)+
+  theme_bw()+
+  xlab("")+
+  ylab("Log2 Enrichment Score")+
+  theme(axis.text.x = element_blank())+
+  scale_fill_manual(values = group_color)+
+  theme(axis.text = element_text(size=11))+
+  ggtitle("Immune cells (xCell2)")
+
+
+
+ggplot(xcell_long%>%
+         dplyr::filter(Celltype=="Tumor Epithelial")%>%
+         dplyr::select(case_id,condition,value)%>%
+         unique(),aes(x=condition,y=value)) +
+  #geom_violin(scale = "width",trim = T)+
+  geom_dotplot(aes( fill = condition),color=NA,
+                 binaxis = "y",         # which axis to bin along
+                 binwidth = 0.02,        # Minimal difference considered diffeerent
+                 stackdir = "center"    # Centered
+                 )+
+  #geom_point(position = position_jitterdodge(0.6),size=1)+
+  theme_bw()+
+  xlab("")+
+  ylab("Enrichment Score")+
+  theme(axis.text.x = element_blank())+
+  scale_fill_manual(values = group_color)+
+  stat_summary(fun.y = median, fun.ymin = median, fun.ymax = median,
+                 geom = "crossbar", width = 0.6)
+
+write.csv(xcell_long,"../Output/xCell2_OutPut.csv")
+
+Paired = xcell_long%>%
+  reshape2::dcast(case_id+Celltype+X~Tissuetype,value.var = "value")%>%
+  drop_na()%>%
+  left_join(meta_RNA%>%
+              dplyr::filter(!condition=="Normal")%>%
+              dplyr::select(case_id,condition)%>%
+              unique(),by="case_id")
+
+library(ggrepel)
+ggplot(Paired%>%
+         dplyr::filter(Celltype=="Immune cells")%>%
+         dplyr::select(case_id,condition,normal,tumor)%>%
+         group_by(case_id,condition)%>%
+         summarise(normal=sum(normal),
+                   tumor=sum(tumor))%>%
+         ungroup()%>%
+         unique(),aes(x=normal,y=tumor,color=condition))+
+  geom_point()+theme_bw()+
+  geom_abline()+
+  scale_color_manual(values = group_color)+
+  scale_x_continuous(limits = c(0,0.5))+
+  scale_y_continuous(limits = c(0,0.5))+
+  geom_text_repel(data=Paired%>%
+         dplyr::filter(Celltype=="Immune cells")%>%
+         dplyr::select(case_id,condition,normal,tumor)%>%
+         group_by(case_id,condition)%>%
+         summarise(normal=sum(normal),
+                   tumor=sum(tumor))%>%
+         ungroup()%>%
+         unique()%>%
+           dplyr::filter(normal>tumor&condition=="No.Tumor"),aes(label=case_id),color="black")+
+  theme(axis.text = element_text(size=11),
+        axis.title = element_text(size=11))+
+  xlab("NAT enrichment score")+
+  ylab("Tumor enrichment score")+
+  ggtitle("xCell2-Immune")
+
+library(ggrepel)
+ggplot(Paired%>%
+         dplyr::filter(X=="Tumor epithelial"),aes(x=normal,y=tumor,color=condition))+
+  geom_point()+theme_bw()+
+  geom_abline()+
+  scale_color_manual(values = group_color)+
+  scale_x_continuous(limits = c(0,0.8))+
+  scale_y_continuous(limits = c(0,0.8))+
+  geom_text_repel(data=Paired%>%
+         dplyr::filter(X=="Tumor epithelial")%>%
+           dplyr::filter(tumor<normal),aes(label=case_id),color="black")+
+  theme(axis.text = element_text(size=11),
+        axis.title = element_text(size=11))+
+  xlab("NAT enrichment score")+
+  ylab("Tumor enrichment score")+
+  ggtitle("xCell2")
+
+
+
+mat <- xcell_long %>%
+  dplyr::select(X, variable, value) %>%
+  tidyr::pivot_wider(names_from = variable, values_from = value) %>%
+  column_to_rownames("X") %>%
+  as.matrix()
+mat_z <- t(scale(t(mat)))   # row-wise z-score
+mat_z[is.na(mat_z)] <- 0 
+mat_z[mat_z > 2] <- 2
+mat_z[mat_z < -2] <- -2
+  
+row_anno <- xcell_long %>%
+  dplyr::select(X, Celltype) %>%
+  distinct() %>%
+  column_to_rownames("X")%>%
+  mutate(Celltype=factor(Celltype,levels=c("Tumor Epithelial", "Normal Epithelial", 
+                    "Immune cells", "Stromal/Endo cells")))%>%
+  dplyr::arrange(Celltype)
+
+col_anno <- meta_RNA %>%
+  rownames_to_column("variable") %>%
+  dplyr::select(variable, condition) %>%
+  distinct() %>%
+  column_to_rownames("variable")%>%
+  dplyr::arrange(condition)
+
+mat_z = mat_z[rownames(row_anno),rownames(col_anno)]
+
+anno_color = list(
+  "condition"= group_color
+)
+names(anno_color$condition) = group_level
+
+library(pheatmap)
+
+pheatmap(
+  mat_z,
+  cluster_cols = FALSE,   # no column clustering
+  cluster_rows = FALSE,   # you already ordered rows
+  annotation_col = col_anno,
+  show_colnames = FALSE,
+  annotation_colors = anno_color,
+  show_rownames = TRUE,
+  scale = "none",         # already scaled
+  color = colorRampPalette(c("blue", "white", "red"))(100)
+)
+
+xcell_long_sum = xcell_long%>%
+  group_by(condition,Celltype,variable)%>%
+  summarise(value=sum(value))%>%
+  ungroup()
+
+ggplot(xcell_long_sum%>%
+         dplyr::filter(Celltype=="Immune cells"),aes(x=condition,y=value,fill=condition))+
+  geom_boxplot(outlier.shape = NA)+
+  geom_point(color="black",position = position_jitter(0.2),alpha=0.4,size=1)+
+  theme_bw()+
+  facet_wrap(~Celltype,scales = "free_y")+
+  xlab("")+
+  ylab("Log2 (CPM +1)")+
+  theme(axis.text.x = element_blank())+
+  scale_fill_manual(values = group_color)+
+  scale_y_continuous(limits = c(0,0.25))
+  
+LG_sufficient = mat%>%
+  as.data.frame()%>%
+  rownames_to_column("Celltype")%>%
+  reshape2::melt(id.vars="Celltype")%>%
+  group_by(variable)%>%
+  mutate(sum = sum(value),
+         perc = value/sum)%>%
+  ungroup()%>%
+  dplyr::filter(Celltype=="Tumor epithelial")%>%
+  left_join(meta_RNA%>%
+              rownames_to_column("variable"),by="variable")%>%
+  mutate(Purity=as.numeric(Purity))%>%
+  dplyr::filter(condition=="Sufficient.Purity")
+
+
+library(ggpubr)
+ggplot(LG_sufficient,aes(x=perc,y=Purity))+
+  geom_point()+
+  theme_bw()+
+  xlab("xCell Purity")+
+  ylab("Genomic Purity")+
+  theme(axis.text = element_text(size=11))+
+  scale_y_continuous(expand = c(0,0),limits = c(0,1),labels = scales::percent)+
+  scale_x_continuous(expand = c(0,0),limits = c(0,1),labels = scales::percent)+
+  geom_smooth(method = "lm", se = FALSE) +
+  stat_cor(
+    method = "pearson",
+    label.x.npc = "left", 
+    label.y.npc = "top"
+  )
+
+
+```
+

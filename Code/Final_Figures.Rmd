@@ -1,0 +1,1545 @@
+---
+title: "Final_Figure"
+output: html_document
+date: "2026-06-25"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Library, color and functiosn
+
+```{r}
+
+
+Distiguish_color = c(
+  "dodgerblue2", "#E31A1C", # red
+  "green4",
+  "#6A3D9A", # purple
+  "#FF7F00", # orange
+  "black", "gold1",
+  "skyblue2", "#FB9A99", # lt pink
+  "palegreen2",
+  "#CAB2D6", # lt purple
+  "#FDBF6F", # lt orange
+  "gray70", "khaki2",
+  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+  "darkturquoise", "green1", "yellow4", "yellow3",
+  "darkorange4", "brown"
+)
+
+
+Main_group_level = c("Normal",
+"No Tumor",
+"Driverless Low Purity",
+"ERG",
+"ETV1",
+"ETV4",
+"FOXA1",
+"SPOP",
+"Multifocal",
+"Rare"
+
+)
+Main_group_color = c(
+  "#a7c7e7",
+"#fce5a1",
+"#f6b26b",
+"#e4aca3",
+"#cc877d",
+"#a76969",
+"#6c5b7b",
+"#f67280",
+"#ff6a00",
+"#b071bd"
+)
+
+groups_cellularity = c(
+  "Normal","1-10%","10-25%" , "25-50%" , "50-75%" , "75-100%"
+)
+Cellularity_color = c(
+  "#a7c7e7",
+"#fee391",
+"#fec44f",
+"#fe9929",
+"#d95f0e",
+"#993404")
+
+
+col_scale_small = colorRampPalette(c("#08306b","#2171b5","white","#ef3b2c","#67000d"))(1000)
+
+col_scale = rev(colorRampPalette(brewer.pal(7,name = "RdBu"))(1000))
+
+
+group_levels <- c("Normal", "No.Tumor", "Low.Purity", "multifocal", "Sufficient.Purity")
+group_color <- c(
+  "Normal" = "#a7c7e7",
+  "No.Tumor" = "#fce5a1",
+  "Low.Purity" = "#f6b26b",
+  "multifocal" = "#ff6a00",
+  "Sufficient.Purity" = "#e06666"
+)
+
+Gleason_levels = c("Normal",
+"GG1",
+"GG2",
+"GG3",
+"GG4",
+"GG5",
+"No_Baseline",
+"Unknown"
+)
+
+Gleason_color = c(
+"#a7c7e7",
+"#F9DCE8",
+"#F29BB7",
+"#E85D75",
+"#B23A68",
+"#6A1B5C",
+"#CCCCCC",
+"#000000"
+)
+
+Tumor_normal_color = c("#a7c7e7",
+"#ec486d"
+)
+
+scale_rows = function(x){
+    m = apply(x, 1, mean, na.rm = T)
+    s = apply(x, 1, sd, na.rm = T)
+    return((x - m) / s)
+}
+
+dot_id_to_freeze_id <- function(x) {
+  x <- gsub("\\.", "-", x)
+  x <- sub("-([NT])$", "_\\1", x)
+  x
+}
+
+freeze_id_to_dot_id <- function(x) {
+  x <- gsub("_", ".", x)
+  x <- sub("-", ".", x)
+  x
+}
+
+keep_complete_pairs <- function(meta_df) {
+  meta_df %>%
+    group_by(pair_id) %>%
+    filter(all(c("NAT", "Tumor") %in% Tissue), n() == 2) %>%
+    ungroup()
+}
+
+format_bcr_gleason <- function(x) {
+  x <- as.character(x)
+  x <- ifelse(is.na(x) | x == "", "Unknown", x)
+  x <- ifelse(x %in% c("N", "GGN"), "Normal", x)
+  x <- ifelse(
+    x %in% c("Normal", "No_Baseline", "Unknown"),
+    x,
+    paste0("GG", as.numeric(gsub("^GG", "", x)))
+  )
+  factor(x, levels = Gleason_levels)
+}
+
+age_bin_to_midpoint <- function(x) {
+  x <- as.character(x)
+  case_when(
+    x == "30-40" ~ 35,
+    x == "40-50" ~ 45,
+    x == "50-60" ~ 55,
+    x == "60-70" ~ 65,
+    x == "70-80" ~ 75,
+    TRUE ~ suppressWarnings(as.numeric(x))
+  )
+}
+
+age_to_range <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  out <- case_when(
+    is.na(x) ~ "Unknown",
+    x >= 30 & x < 40 ~ "30-40",
+    x >= 40 & x < 50 ~ "40-50",
+    x >= 50 & x < 60 ~ "50-60",
+    x >= 60 & x < 70 ~ "60-70",
+    x >= 70 & x < 80 ~ "70-80",
+    x >= 80 & x < 90 ~ "80-90",
+    TRUE ~ "Unknown"
+  )
+  factor(out, levels = age_range_levels)
+}
+
+make_clean_design <- function(meta_df) {
+  meta_df <- meta_df %>%
+    mutate(
+      pair_id = factor(pair_id),
+      batch = factor(batch),
+      tumor_black = as.numeric(Tissue == "Tumor" & race == "Black"),
+      tumor_white = as.numeric(Tissue == "Tumor" & race == "White")
+    )
+
+  make_design_once <- function(include_batch) {
+    #if (include_batch && n_distinct(meta_df$batch) > 1) {
+    #  design <- model.matrix(~ 0 + pair_id + batch + tumor_black + tumor_white, data = meta_df)
+    #} else {
+    design <- model.matrix(~ 0 + pair_id + tumor_black + tumor_white, data = meta_df)
+    #}
+    colnames(design) <- make.names(colnames(design))
+
+    not_estimable <- limma::nonEstimable(design)
+    if (!is.null(not_estimable)) {
+      design <- design[, !colnames(design) %in% not_estimable, drop = FALSE]
+    }
+
+    design
+  }
+
+  design <- make_design_once(TRUE)
+  if (!all(c("tumor_black", "tumor_white") %in% colnames(design))) {
+    design <- make_design_once(FALSE)
+  }
+
+  if (!all(c("tumor_black", "tumor_white") %in% colnames(design))) {
+    stop("tumor_black or tumor_white is not estimable for this metadata.")
+  }
+
+  design
+}
+
+run_race_interaction <- function(expr_mat, meta_df, label) {
+  meta_sub <- meta_df %>%
+    filter(matrix_col %in% colnames(expr_mat)) %>%
+    keep_complete_pairs() %>%
+    arrange(cohort, race, pair_id, Tissue) %>%
+    mutate(
+      race = factor(race, levels = c("White", "Black")),
+      Tissue = factor(Tissue, levels = c("NAT", "Tumor"))
+    )
+
+  mat_sub <- expr_mat[, meta_sub$matrix_col, drop = FALSE]
+  keep <- rowSums(!is.na(mat_sub)) >= max(8, ceiling(ncol(mat_sub) * 0.25))
+  mat_sub <- mat_sub[keep, , drop = FALSE]
+
+  design <- make_clean_design(meta_sub)
+  fit <- lmFit(mat_sub, design)
+  contr <- makeContrasts(
+    Race_delta = tumor_black - tumor_white,
+    Black_Tumor_vs_NAT = tumor_black,
+    White_Tumor_vs_NAT = tumor_white,
+    levels = design
+  )
+  fit2 <- contrasts.fit(fit, contr)
+  fit2 <- eBayes(fit2)
+
+  race_res <- topTable(fit2, coef = "Race_delta", n = Inf, sort.by = "P") %>%
+    rownames_to_column("feature_id") %>%
+    mutate(gene = feature_id) %>%
+    rename(FDR = adj.P.Val) %>%
+    mutate(
+      contrast = "Race_delta",
+      race_difference = FDR < fdr_cut & abs(logFC) >= logfc_cut,
+      race_direction = case_when(
+        race_difference & logFC > 0 ~ "Black stronger tumor-change",
+        race_difference & logFC < 0 ~ "White stronger tumor-change",
+        TRUE ~ "Non-sig"
+      )
+    ) %>%
+    select(feature_id, gene, contrast, logFC, AveExpr, t, P.Value, FDR, B, race_difference, race_direction)
+
+  black_res <- topTable(fit2, coef = "Black_Tumor_vs_NAT", n = Inf, sort.by = "P") %>%
+    rownames_to_column("feature_id") %>%
+    mutate(gene = feature_id) %>%
+    rename(FDR = adj.P.Val) %>%
+    mutate(
+      contrast = "Black_Tumor_vs_NAT",
+      DEG = FDR < fdr_cut & abs(logFC) >= logfc_cut
+    )
+
+  white_res <- topTable(fit2, coef = "White_Tumor_vs_NAT", n = Inf, sort.by = "P") %>%
+    rownames_to_column("feature_id") %>%
+    mutate(gene = feature_id) %>%
+    rename(FDR = adj.P.Val) %>%
+    mutate(
+      contrast = "White_Tumor_vs_NAT",
+      DEG = FDR < fdr_cut & abs(logFC) >= logfc_cut
+    )
+
+  pair_res <- black_res %>%
+    select(feature_id, gene, black_logFC = logFC, black_FDR = FDR, black_DEG = DEG) %>%
+    full_join(
+      white_res %>% select(feature_id, gene, white_logFC = logFC, white_FDR = FDR, white_DEG = DEG),
+      by = c("feature_id", "gene")
+    ) %>%
+    left_join(
+      race_res %>% select(feature_id, race_delta_logFC = logFC, race_delta_FDR = FDR, race_difference, race_direction),
+      by = "feature_id"
+    ) %>%
+    mutate(
+      tumor_normal_DEG_union = (black_DEG %in% TRUE) | (white_DEG %in% TRUE),
+      race_modified_tumor_signal = tumor_normal_DEG_union & (race_difference %in% TRUE),
+      pattern = case_when(
+        !race_modified_tumor_signal ~ "No significant race difference",
+        black_logFC > 0 & white_logFC < 0 ~ "Opposite: Black up, White down",
+        black_logFC < 0 & white_logFC > 0 ~ "Opposite: Black down, White up",
+        black_DEG %in% TRUE & !(white_DEG %in% TRUE) & black_logFC > 0 ~ "Black-specific tumor up",
+        black_DEG %in% TRUE & !(white_DEG %in% TRUE) & black_logFC < 0 ~ "Black-specific tumor down",
+        white_DEG %in% TRUE & !(black_DEG %in% TRUE) & white_logFC > 0 ~ "White-specific tumor up",
+        white_DEG %in% TRUE & !(black_DEG %in% TRUE) & white_logFC < 0 ~ "White-specific tumor down",
+        black_logFC > 0 & white_logFC > 0 & race_delta_logFC > 0 ~ "Both up, stronger in Black",
+        black_logFC > 0 & white_logFC > 0 & race_delta_logFC < 0 ~ "Both up, stronger in White",
+        black_logFC < 0 & white_logFC < 0 & race_delta_logFC > 0 ~ "Both down, stronger loss in Black",
+        black_logFC < 0 & white_logFC < 0 & race_delta_logFC < 0 ~ "Both down, stronger loss in White",
+        TRUE ~ "Race-modified magnitude"
+      )
+    )
+
+  write_tsv(meta_sub, file.path(out_dir, paste0("DDA_corrected_", label, "_paired_metadata.tsv")))
+  write_tsv(race_res, file.path(out_dir, paste0("DDA_corrected_", label, "_limma_paired_race_delta.tsv")))
+  write_tsv(black_res, file.path(out_dir, paste0("DDA_corrected_", label, "_Black_Tumor_vs_NAT.tsv")))
+  write_tsv(white_res, file.path(out_dir, paste0("DDA_corrected_", label, "_White_Tumor_vs_NAT.tsv")))
+  write_tsv(pair_res, file.path(out_dir, paste0("DDA_corrected_", label, "_Black_vs_White_Tumor_vs_NAT_summary.tsv")))
+
+  list(meta = meta_sub, mat = mat_sub, race = race_res, black = black_res, white = white_res, paired = pair_res)
+}
+
+draw_volcano <- function(res_df, label) {
+  p <- ggplot(res_df, aes(logFC, -log10(P.Value))) +
+    geom_point(aes(color = race_direction), size = 1.3) +
+    geom_vline(xintercept = c(-logfc_cut, logfc_cut), linetype = 2, color = "grey45") +
+    geom_hline(yintercept = -log10(0.05), linetype = 2, color = "grey45") +
+    ggrepel::geom_text_repel(
+      data = res_df %>% filter(race_difference) %>% arrange(FDR) %>% slice_head(n = 15),
+      aes(label = gene),
+      size = 3,
+      max.overlaps = Inf,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(values = volcano_color) +
+    theme_bw() +
+    theme(axis.text = element_text(size = 10, color = "black"),
+          legend.title = element_blank()) +
+    xlab("(Black Tumor-NAT) - (White Tumor-NAT)") +
+    ylab("-log10(P)") +
+    ggtitle(label)
+
+  ggsave(file.path(out_dir, paste0(label, "_volcano.pdf")), p, width = 6.3, height = 5.1)
+  ggsave(file.path(out_dir, paste0(label, "_volcano.png")), p, width = 6.3, height = 5.1, dpi = 300)
+  p
+}
+
+draw_fc_scatter <- function(pair_df, label) {
+  plot_df <- pair_df %>%
+    mutate(sig_class = case_when(
+      race_modified_tumor_signal ~ "Race-modified tumor signal",
+      tumor_normal_DEG_union ~ "Tumor-NAT DEG, no race interaction",
+      TRUE ~ "Not DEG"
+    ))
+
+  axis_lim <- max(abs(c(plot_df$black_logFC, plot_df$white_logFC)), na.rm = TRUE)
+  axis_lim <- max(1, ceiling(axis_lim))
+
+  p <- ggplot(plot_df, aes(black_logFC, white_logFC)) +
+    geom_hline(yintercept = 0, color = "grey78") +
+    geom_vline(xintercept = 0, color = "grey78") +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey45") +
+    geom_point(aes(color = sig_class), size = 1.25, alpha = 0.72) +
+    ggrepel::geom_text_repel(
+      data = plot_df %>% filter(race_modified_tumor_signal) %>% arrange(race_delta_FDR) %>% slice_head(n = 18),
+      aes(label = gene, color = sig_class),
+      size = 3,
+      max.overlaps = Inf,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(values = c(
+      "Race-modified tumor signal" = "#d7301f",
+      "Tumor-NAT DEG, no race interaction" = "#6b8fb3",
+      "Not DEG" = "grey82"
+    )) +
+    coord_cartesian(xlim = c(-axis_lim, axis_lim), ylim = c(-axis_lim, axis_lim)) +
+    theme_bw() +
+    theme(axis.text = element_text(size = 10, color = "black"),
+          legend.title = element_blank()) +
+    xlab("Black log2FC Tumor vs NAT") +
+    ylab("White log2FC Tumor vs NAT") +
+    ggtitle(label)
+
+  ggsave(file.path(out_dir, paste0(label, "_Black_vs_White_logFC_scatter.pdf")), p, width = 6.2, height = 5.3)
+  ggsave(file.path(out_dir, paste0(label, "_Black_vs_White_logFC_scatter.png")), p, width = 6.2, height = 5.3, dpi = 300)
+  p
+}
+
+```
+
+# data
+
+```{r}
+# Load data
+
+Meta = read.csv("./raw/raw/Hongyi/extended meta data - 5_7_2026 - Updated by Hongyi.csv")
+Meta_JHU = read_xlsx("./raw/raw/JHU/meta_select1-cptac-24-patients-3-11-2026.xlsx")
+JHU_idmatch = read_excel("./raw/raw/Data freeze/Sample ID match/PRAD_TMT_DDA_JHU Sample ID match.xlsx")%>%
+  mutate(sample_id = ifelse(`sample type`=="benign",paste("JHU",`sample ID`,"N",sep = "."),paste("JHU",`sample ID`,"T",sep = ".")))%>%
+  mutate(ptID = gsub("[A-F]","",`sample ID`),
+         Type = ifelse(`sample type`=="benign","Benign","Cancer"))
+
+
+
+
+Protein_DDA_raw = read_tsv("./raw/raw/Data freeze/Cohort_1_CPTAC/Global_TMT_DDA/prostate_CPTAC_prot_TMT_full_ratio_protein_MD.tsv")
+Protein_DDA_raw_JHU = read_tsv("./raw/raw/Data freeze/Cohort_2_JHU/Global_TMT_DDA/prostate_JHU_prot_TMT_ratio_protein_MD.tsv")
+
+Protein_DIA_raw = read_tsv("./raw/raw/Data freeze/Cohort_1_CPTAC/Global_DIA/prostate_CPTAC_prot_DIA_full_protein_report.pg_matrix.tsv")
+Protein_DIA_raw_JHU = read_tsv("./raw/raw/Data freeze/Cohort_2_JHU/Global_DIA/prostate_JHU_prot_DIA_protein_report.pg_matrix.tsv")
+
+RNA_raw = read.csv("./raw/raw/Data freeze/Cohort_1_CPTAC/mRNA/01_RNA_PRAD_tumor_normal_count_v3.csv")
+RNA_TPM = read_excel("./raw/raw/Data freeze/Cohort_1_CPTAC/mRNA/CPTAC_RNAseq_log2TPM.xlsx")
+
+RNA_raw_JHU = read_tsv("./raw/raw/Data freeze/Cohort_2_JHU/mRNA/counts.tsv")
+RNA_TPM_JHU = read_tsv("./raw/raw/Data freeze/Cohort_2_JHU/mRNA/tpm.tsv")
+
+Meth_raw = fread("./raw/raw/Hongyi/Methelaytion/10_mvalues_annotated_fulldata-002.csv")
+
+Phospho_raw = read_tsv("./raw/raw/Data freeze/Cohort_1_CPTAC/Phospho_ST/prostate_CPTAC_phospho_TMT_full_abundance_single_site_MD_pST_from_phospho.tsv")
+Phospho_raw_JHU = read_tsv("./raw/raw/Data freeze/Cohort_2_JHU/Phospho_STY/prostate_JHU_phospho_abundance_single_site_MD.tsv")
+
+pY_raw = read_tsv("./raw/raw/Data freeze/Cohort_1_CPTAC/Phospho_Tyr/prostate_CPTAC_pY_TMT_full_abundance_single_site_MD_pY_merged.tsv")
+
+Glyco_raw = read_tsv("./raw/raw/Data freeze/Cohort_1_CPTAC/Glyco/glyco_CPTAC_nglycoform-peptide_matrix-abundances-MD_norm_renamed_merged.tsv")
+Glyco_raw_JHU = read_tsv("./raw/raw/Data freeze/Cohort_2_JHU/Glyco/glyco_JHU_nglycoform-peptide_matrix-abundances-MD_norm_renamed_merged.tsv")
+
+
+xCell_CPTAC= read.csv("./Output/xCell2_OutPut.csv")
+xCell_JHU = read_csv("./Output/xCell2_OutPut_JHU.csv")
+
+```
+
+# Figure2
+
+## Fig2A
+
+```{r}
+
+
+xCell_result = xCell_CPTAC%>%
+  dplyr::rename(sample_id=variable)%>%
+  group_by(sample_id)%>%
+  mutate(total=sum(value))%>%
+  ungroup()%>%
+  mutate(perc = value/total)%>%
+  mutate(log = log2(value+0.001))%>%
+  mutate(X=ifelse(X=="Normal prostate epithelial","Normal epithelial",X))
+
+Meta_cellularity = xCell_result%>%
+  group_by(sample_id,condition,X)%>%
+  summarise(perc = sum(perc))%>%
+  ungroup()%>%
+  dplyr::filter(!condition=="Normal")
+
+sample_order = Meta_cellularity%>%
+  reshape2::dcast(sample_id~X,value.var = "perc")%>%
+  dplyr::filter(`Tumor epithelial`>0.05)%>%
+  dplyr::arrange(`Tumor epithelial`)
+
+meta_heat = xCell_result%>%
+  mutate(celltype_major = ifelse(X%in%c("CD4 T cell","CD8 T cell"),"T-cell",X),
+         celltype_major = ifelse(X%in%c("CD14+ Monocyte","CD14- Monocyte"),"Monocyte",celltype_major),
+         celltype_major = ifelse(X%in%c("M2-Macrophage","M0-Macrophage"),"Macrophage",celltype_major))%>%
+  group_by(sample_id,celltype_major)%>%
+  summarise(perc=sum(perc))%>%
+  ungroup()%>%
+  reshape2::dcast(sample_id~celltype_major,value.var = "perc")%>%
+  left_join(Meta%>%
+                dplyr::rename(sample_id = common_ID),by="sample_id")%>%
+  mutate(
+    new_group = case_when(
+      `Tumor epithelial` < 0.01&Tissuetype=="normal"&`Normal epithelial`>0.5 ~ "Normal",
+      `Tumor epithelial` < 0.1&Tissuetype!="normal" ~ "1-10%",
+      `Tumor epithelial` < 0.25&Tissuetype!="normal" ~ "10-25%",
+      `Tumor epithelial` < 0.5&Tissuetype!="normal" ~ "25-50%",
+      `Tumor epithelial` < 0.75&Tissuetype!="normal" ~ "50-75%",
+      `Tumor epithelial` >= 0.75&Tissuetype!="normal" ~ "75-100%",
+      TRUE ~ "Other"
+    )
+  )%>%
+  dplyr::filter(sample_id%in%sample_order$sample_id)
+
+# Add pd1, pdl1 expression
+gene = c("PDCD1","CD274")
+
+tpm_sub = RNA_TPM[RNA_TPM$gene_name.T%in%gene,]%>%
+  as.data.frame()%>%
+  column_to_rownames("gene_name.T")%>%
+  dplyr::select(-gene_id.T,-gene_biotype.T)%>%
+  t()%>%
+  as.data.frame()%>%
+  rownames_to_column("sample_id")
+
+
+Matrix = xCell_result%>%
+  #mutate(celltype_major = ifelse(X%in%c("CD4 T cell","CD8 T cell"),"T-cell",X),
+  #       celltype_major = ifelse(X%in%c("CD14+ Monocyte","CD14- Monocyte"),"Monocyte",celltype_major),
+  #       celltype_major = ifelse(X%in%c("M2-Macrophage","M0-Macrophage"),"Macrophage",celltype_major))%>%
+  group_by(sample_id,X)%>%
+  summarise(perc=sum(perc))%>%
+  ungroup()%>%
+  reshape2::dcast(sample_id~X,value.var = "perc")%>%
+  dplyr::select(-`Tumor epithelial`,-`Normal epithelial`,-Club,-`Smooth-muscle`,-Fibroblast,-Endothelial)%>%
+  left_join(tpm_sub,by="sample_id")%>%
+  column_to_rownames("sample_id")%>%
+  dplyr::select(PDCD1,CD274,`M0-Macrophage`,`M2-Macrophage`,`CD14+ Monocyte`,`CD14- Monocyte`,
+                Myeloid,`CD4 T cell`,`CD8 T cell`,`T-cell`,Mast)%>%
+  t()%>%
+  as.data.frame()%>%
+  dplyr::select(sample_order$sample_id)%>%
+  as.matrix()
+
+ComplexHeatmap::pheatmap(Matrix,cluster_rows = F,cluster_cols = T,gaps_row = 2,treeheight_col = 20,cutree_cols = 5,silent = F,scale = "row",color = col_scale_small)
+
+
+manual_order = Matrix%>%
+  t()%>%
+  as.data.frame()%>%
+  mutate(T_all = `CD4 T cell` + `CD8 T cell`+`T-cell`,
+         PD_all = PDCD1+CD274,
+         Mac_all= `M0-Macrophage`+`M2-Macrophage`+`CD14+ Monocyte`+`CD14- Monocyte`+Myeloid)%>%
+  rownames_to_column("sample_id")
+
+T_pos = manual_order%>%
+  dplyr::filter(T_all>0.005)%>%
+  dplyr::arrange(desc(T_all))
+
+Macro_pos = manual_order%>%
+  dplyr::filter(Mac_all>0.1&!sample_id%in%T_pos$sample_id)%>%
+  dplyr::arrange(desc(Mac_all))
+
+PD_pos =  manual_order%>%
+  dplyr::filter(PD_all>4&!sample_id%in%c(T_pos$sample_id,Macro_pos$sample_id))%>%
+  dplyr::arrange(desc(PD_all))
+
+other = manual_order%>%
+  dplyr::filter(!sample_id%in%c(T_pos$sample_id,Macro_pos$sample_id,PD_pos$sample_id))%>%
+  dplyr::arrange(desc(Mast))
+
+Matrix_new = scale_rows(Matrix)%>%
+  as.data.frame()%>%
+  dplyr::select(T_pos$sample_id,Macro_pos$sample_id,PD_pos$sample_id,other$sample_id)%>%
+  as.matrix()
+
+# color function
+col_fun <- circlize::colorRamp2(
+  c(-4, 0, 4),
+  c("#2166ac", "white", "red")
+)
+
+ordered_samples = colnames(Matrix_new)
+
+cluster_df = colnames(Matrix_new)%>%
+  as.data.frame()%>%
+  dplyr::rename("sample_id"=".")%>%
+  mutate(cluster = ifelse(sample_id%in%T_pos$sample_id,"C1","C3"),
+         cluster = ifelse(sample_id%in%Macro_pos$sample_id,"C2",cluster))
+
+
+Matrix_additional = xCell_result%>%
+  group_by(sample_id,X)%>%
+  summarise(perc=sum(perc))%>%
+  ungroup()%>%
+  reshape2::dcast(sample_id~X,value.var = "perc")%>%
+  left_join(tpm_sub,by="sample_id")%>%
+  column_to_rownames("sample_id")%>%
+  dplyr::select(`Tumor epithelial`,`Normal epithelial`,Club,`Smooth-muscle`,Fibroblast,Endothelial)%>%
+  t()%>%
+  as.data.frame()%>%
+  dplyr::select(colnames(Matrix_new))
+
+
+Matrix_additional = scale_rows(Matrix_additional)
+
+matrix_all = rbind(Matrix_additional,Matrix_new)
+
+row_split = factor(
+  c(rep("general",6),rep("Checkpoint", 2), rep("Immune", nrow(Matrix) - 2)),
+  levels = c("general","Checkpoint", "Immune")
+)
+
+
+annot_col = meta_heat %>%
+  dplyr::select(sample_id, new_group, BCR_Gleason_Grade,ethnicity) %>%
+  mutate(
+    BCR_Gleason_Grade = as.character(BCR_Gleason_Grade),
+    
+    BCR_Gleason_Grade = ifelse(
+      BCR_Gleason_Grade=="",
+      "Unknown",
+      BCR_Gleason_Grade
+    ),
+    
+    BCR_Gleason_Grade = ifelse(
+      BCR_Gleason_Grade %in% c("Normal", "No_Baseline", "Unknown"),
+      BCR_Gleason_Grade,
+      paste0("GG", as.numeric(BCR_Gleason_Grade))
+    ),
+    
+    BCR_Gleason_Grade = factor(
+      BCR_Gleason_Grade,
+      levels = Gleason_levels
+    )
+  )%>%
+  dplyr::filter(sample_id%in%colnames(Matrix_new))%>%
+  unique()%>%
+  left_join(cluster_df,by="sample_id")%>%
+  column_to_rownames("sample_id")
+
+
+color = list(
+  "new_group" = Cellularity_color[2:6],
+  "BCR_Gleason_Grade" = Gleason_color[2:6],
+  "cluster" = Distiguish_color[3:5],
+  "ethnicity" = c("#fbb4ae",
+"#b3cde3",
+"#ccebc5"))
+names(color$new_group) = groups_cellularity[2:6]
+names(color$BCR_Gleason_Grade) = Gleason_levels[2:6]
+names(color$cluster) = paste0("C", 1:3)
+names(color$ethnicity) = c("Caucasian","Black","Other")
+
+annot_col <- annot_col[colnames(matrix_all), , drop = FALSE]
+column_split = factor(annot_col$cluster, levels = c("C1","C2","C3"))
+
+ha_col <- ComplexHeatmap::HeatmapAnnotation(
+  df = annot_col,
+  col = color
+)
+
+ht_all <- ComplexHeatmap::Heatmap(
+  matrix_all,
+  name = "Z-score",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = F,
+  cluster_column_slices = FALSE,
+  row_split = row_split,
+  top_annotation = ha_col,
+  column_split = column_split,
+  na_col = "white",
+  show_column_names = FALSE,
+  show_row_names = TRUE,
+  row_title = NULL,
+  row_names_gp = grid::gpar(fontsize = 12),
+  column_dend_height = grid::unit(20, "mm")
+)
+
+ComplexHeatmap::draw(ht_all)
+
+```
+
+### JHU
+
+```{r}
+
+xCell_JHU_2 = read.csv("./Output/xCell2_OutPut_JHU.csv")%>%
+  dplyr::rename(sample_id=variable)%>%
+  group_by(sample_id)%>%
+  mutate(total=sum(value))%>%
+  ungroup()%>%
+  mutate(perc = value/total)%>%
+  mutate(log = log2(value+0.001))%>%
+  mutate(X=ifelse(X=="Normal prostate epithelial","Normal epithelial",X))
+
+Meta_cellularity = xCell_JHU_2%>%
+  group_by(sample_id,Type,X)%>%
+  summarise(perc = sum(perc))%>%
+  ungroup()%>%
+  dplyr::filter(Type=="Cancer")
+
+sample_order = Meta_cellularity%>%
+  reshape2::dcast(sample_id~X,value.var = "perc")%>%
+  dplyr::filter(`Tumor epithelial`>0.05)%>%
+  dplyr::arrange(`Tumor epithelial`)
+
+meta_heat_JHU = xCell_JHU_2%>%
+  mutate(celltype_major = ifelse(X%in%c("CD4 T cell","CD8 T cell"),"T-cell",X),
+         celltype_major = ifelse(X%in%c("CD14+ Monocyte","CD14- Monocyte"),"Monocyte",celltype_major),
+         celltype_major = ifelse(X%in%c("M2-Macrophage","M0-Macrophage"),"Macrophage",celltype_major))%>%
+  group_by(sample_id,celltype_major)%>%
+  summarise(perc=sum(perc))%>%
+  ungroup()%>%
+  reshape2::dcast(sample_id~celltype_major,value.var = "perc")%>%
+  left_join(Meta_JHU%>%
+                dplyr::rename(sample_id = sampleID),by="sample_id")%>%
+  mutate(
+    new_group = case_when(
+      `Tumor epithelial` < 0.01&Type=="Benign"&`Normal epithelial`>0.5 ~ "Normal",
+      `Tumor epithelial` < 0.1&Type!="Benign" ~ "1-10%",
+      `Tumor epithelial` < 0.25&Type!="Benign" ~ "10-25%",
+      `Tumor epithelial` < 0.5&Type!="Benign" ~ "25-50%",
+      `Tumor epithelial` < 0.75&Type!="Benign" ~ "50-75%",
+      `Tumor epithelial` >= 0.75&Type!="Benign" ~ "75-100%",
+      TRUE ~ "Other"
+    )
+  )%>%
+  dplyr::filter(!is.na(ptID))%>%
+  mutate(ethnicity = ifelse(RACE=="B","Black","Caucasian"),
+         BCR_Gleason_Grade = paste("GG",GGG,sep = ""))
+
+# Add pd1, pdl1 expression
+gene = c("PDCD1","CD274")
+
+RNA_fkpm_JHU_immune = RNA_TPM_JHU%>%
+  dplyr::filter(!is.na(Gene))%>%
+  group_by(Gene) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  ungroup()%>%
+  column_to_rownames("Gene")%>%
+  as.matrix()
+RNA_fkpm_JHU_immune = log2(RNA_fkpm_JHU_immune+1)
+
+tpm_sub = RNA_fkpm_JHU_immune[gene,]%>%
+  as.data.frame()%>%
+  t()%>%
+  as.data.frame()%>%
+  rownames_to_column("sample_id")
+
+
+Matrix_JHU = xCell_JHU_2%>%
+  #mutate(celltype_major = ifelse(X%in%c("CD4 T cell","CD8 T cell"),"T-cell",X),
+  #       celltype_major = ifelse(X%in%c("CD14+ Monocyte","CD14- Monocyte"),"Monocyte",celltype_major),
+  #       celltype_major = ifelse(X%in%c("M2-Macrophage","M0-Macrophage"),"Macrophage",celltype_major))%>%
+  group_by(sample_id,X)%>%
+  summarise(perc=sum(perc))%>%
+  ungroup()%>%
+  reshape2::dcast(sample_id~X,value.var = "perc")%>%
+  dplyr::select(-`Tumor epithelial`,-`Normal epithelial`,-Club,-`Smooth-muscle`,-Fibroblast,-Endothelial)%>%
+  left_join(tpm_sub,by="sample_id")%>%
+  column_to_rownames("sample_id")%>%
+  dplyr::select(PDCD1,CD274,`M0-Macrophage`,`M2-Macrophage`,`CD14+ Monocyte`,`CD14- Monocyte`,
+                Myeloid,`CD4 T cell`,`CD8 T cell`,`T-cell`,Mast)%>%
+  t()%>%
+  as.data.frame()%>%
+  dplyr::select(sample_order$sample_id)
+
+Matrix_JHU_scaled = scale_rows(Matrix_JHU)
+tree_col = hclust(
+  dist(t(Matrix_JHU_scaled), method = "manhattan"),
+  method = "ward.D2"
+)
+
+manual_order = Matrix_JHU%>%
+  t()%>%
+  as.data.frame()%>%
+  mutate(T_all = `CD4 T cell` + `CD8 T cell`+`T-cell`,
+         PD_all = PDCD1+CD274,
+         Mac_all= `M0-Macrophage`+`M2-Macrophage`+`CD14+ Monocyte`+`CD14- Monocyte`+Myeloid)%>%
+  rownames_to_column("sample_id")
+
+T_pos = manual_order%>%
+  dplyr::filter(T_all>0.02)%>%
+  dplyr::arrange(desc(T_all))
+
+Macro_pos = manual_order%>%
+  dplyr::filter(Mac_all>0.1&!sample_id%in%T_pos$sample_id)%>%
+  dplyr::arrange(desc(Mac_all))
+
+PD_pos =  manual_order%>%
+  dplyr::filter(PD_all>4&!sample_id%in%c(T_pos$sample_id,Macro_pos$sample_id))%>%
+  dplyr::arrange(desc(PD_all))
+
+other = manual_order%>%
+  dplyr::filter(!sample_id%in%c(T_pos$sample_id,Macro_pos$sample_id,PD_pos$sample_id))%>%
+  dplyr::arrange(desc(Mast))
+
+Matrix_new = scale_rows(Matrix_JHU)%>%
+  dplyr::select(T_pos$sample_id,Macro_pos$sample_id,PD_pos$sample_id,other$sample_id)%>%
+  as.matrix()
+
+# color function
+col_fun <- circlize::colorRamp2(
+  c(-4, 0, 4),
+  c("#2166ac", "white", "red")
+)
+
+
+ordered_samples = colnames(Matrix_new)
+
+cluster_df = colnames(Matrix_new)%>%
+  as.data.frame()%>%
+  dplyr::rename("sample_id"=".")%>%
+  mutate(cluster = ifelse(sample_id%in%T_pos$sample_id,"C1","C3"),
+         cluster = ifelse(sample_id%in%Macro_pos$sample_id,"C2",cluster))
+
+
+Matrix_additional = xCell_JHU_2%>%
+  group_by(sample_id,X)%>%
+  summarise(perc=sum(perc))%>%
+  ungroup()%>%
+  reshape2::dcast(sample_id~X,value.var = "perc")%>%
+  left_join(tpm_sub,by="sample_id")%>%
+  column_to_rownames("sample_id")%>%
+  dplyr::select(`Tumor epithelial`,`Normal epithelial`,Club,`Smooth-muscle`,Fibroblast,Endothelial)%>%
+  t()%>%
+  as.data.frame()%>%
+  dplyr::select(colnames(Matrix_new))
+
+
+Matrix_additional = scale_rows(Matrix_additional)
+
+matrix_all_JHU = rbind(Matrix_additional,Matrix_new)
+
+row_split = factor(
+  c(rep("general",6),rep("Checkpoint", 2), rep("Immune", nrow(Matrix) - 2)),
+  levels = c("general","Checkpoint", "Immune")
+)
+
+
+
+annot_col = meta_heat_JHU %>%
+  dplyr::select(sample_id, new_group, BCR_Gleason_Grade,ethnicity) %>%
+  mutate(
+    BCR_Gleason_Grade = as.character(BCR_Gleason_Grade),
+    
+    BCR_Gleason_Grade = ifelse(
+      BCR_Gleason_Grade=="",
+      "Unknown",
+      BCR_Gleason_Grade
+    ),
+    
+    BCR_Gleason_Grade = ifelse(
+      BCR_Gleason_Grade %in% c("Normal", "No_Baseline", "Unknown"),
+      BCR_Gleason_Grade,
+      ifelse(grepl("^GG", BCR_Gleason_Grade), BCR_Gleason_Grade, paste0("GG", as.numeric(BCR_Gleason_Grade)))
+    ),
+    
+    BCR_Gleason_Grade = factor(
+      BCR_Gleason_Grade,
+      levels = Gleason_levels
+    )
+  )%>%
+  dplyr::filter(sample_id%in%colnames(matrix_all_JHU))%>%
+  unique()%>%
+  left_join(cluster_df,by="sample_id")%>%
+  column_to_rownames("sample_id")
+
+
+color = list(
+  "new_group" = Cellularity_color[2:6],
+  "BCR_Gleason_Grade" = Gleason_color[2:6],
+  "cluster" = Distiguish_color[9:11],
+  "ethnicity" = c("#fbb4ae",
+"#b3cde3",
+"#ccebc5"))
+names(color$new_group) = groups_cellularity[2:6]
+names(color$BCR_Gleason_Grade) = Gleason_levels[2:6]
+names(color$cluster) = paste0("C", 1:3)
+names(color$ethnicity) = c("Caucasian","Black","Other")
+
+annot_col <- annot_col[colnames(matrix_all_JHU), , drop = FALSE]
+column_split_JHU = factor(annot_col$cluster, levels = c("C1","C2","C3"))
+
+ha_col <- ComplexHeatmap::HeatmapAnnotation(
+  df = annot_col,
+  col = color
+)
+
+ht_all <- ComplexHeatmap::Heatmap(
+  matrix_all_JHU,
+  name = "Z-score",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = F,
+  cluster_column_slices = FALSE,
+  row_split = row_split,
+  top_annotation = ha_col,
+  column_split = column_split_JHU,
+  na_col = "white",
+  show_column_names = FALSE,
+  show_row_names = TRUE,
+  row_title = NULL,
+  row_names_gp = grid::gpar(fontsize = 12),
+  column_dend_height = grid::unit(20, "mm")
+)
+
+ComplexHeatmap::draw(ht_all)
+```
+
+
+## Fig2B，C, D, E, F, G
+
+### DDA-CPTAC
+
+```{r}
+## DDA CPTAC
+
+cluster_color = c(Distiguish_color[3:5],Distiguish_color[9:11])
+
+meta_heat_JHU_new = merge(meta_heat_JHU,JHU_idmatch,by=c("ptID","Type"))
+
+Matrix_both = cbind(rbind(matrix_all,column_split),
+                    rbind(matrix_all_JHU,column_split_JHU))%>%
+  rownames_to_column("name")%>%
+  reshape2::melt(id.vars="name")%>%
+  left_join(rbind(meta_heat%>%
+                    mutate(variable=sample_id,
+                           cohort = "CPTAG")%>%
+                    dplyr::select(variable,BCR_Gleason_Grade,ethnicity,cohort,new_group,sample_id),
+                  meta_heat_JHU_new%>%
+                    mutate(variable=sample_id.x,
+                           sample_id = sample_id.y,
+                           cohort = "JHU")%>%
+                    dplyr::select(variable,BCR_Gleason_Grade,ethnicity,cohort,new_group,sample_id)),
+            by="variable")%>%
+  mutate(variable = ifelse(cohort=="JHU",sample_id,variable))%>%
+  reshape2::dcast(variable+cohort+BCR_Gleason_Grade+ethnicity+new_group~name,value.var = "value")
+
+immune_cluster_list <- list(
+  `T-cell / cytotoxic` = c(
+    "DCN", "CD8A", "GZMA", "GZMB", "PRF1", "IFNG", "CD8B", "CD4"
+  ),
+  
+  `Checkpoint / immune suppression` = c(
+    "PDCD1", "CTLA4", "TIGIT", "LAG3", "HAVCR2", "IDO1", "CD274"
+  ),
+  
+  `Antigen presentation / IFN` = c(
+    "HLA-A", "HLA-B", "HLA-C", "B2M", "TAP1", "STAT1"
+  ),
+  
+  `Myeloid / macrophage` = c(
+    "CD68", "CD14", "CSF1R", "AIF1", "LYZ", "TYROBP",
+    "CD163", "MRC1", "TREM2"
+  ),
+  
+  `Mast cell` = c(
+    "TPSAB1", "TPSB2", "CPA3", "KIT"
+  ),
+  
+  `B cell / plasma cell` = c(
+    "MS4A1", "CD79A", "MZB1", "JCHAIN","VEGF"
+  ),
+  
+  `Other immune regulation` = c(
+    "CD47"
+  )
+)
+
+immune_cluster_df <- data.frame(
+  group = rep(names(immune_cluster_list), lengths(immune_cluster_list)),
+  geneSymbol = unlist(immune_cluster_list, use.names = FALSE)
+)
+
+
+protein_exp = rbind(Protein_DDA_raw%>%
+    left_join(immune_cluster_df,by="geneSymbol")%>%
+    dplyr::select(-Index)%>%
+    reshape2::melt(id.vars=c("geneSymbol","group"))%>%
+    drop_na()%>%
+    group_by(geneSymbol,variable,group)%>%
+    summarise(value=mean(value))%>%
+    ungroup(),
+  Protein_DDA_raw_JHU%>%
+    as.data.frame()%>%
+    left_join(immune_cluster_df,by="geneSymbol")%>%
+    dplyr::select(-Index)%>%
+    reshape2::melt(id.vars=c("geneSymbol","group")))%>%
+  drop_na()%>%
+  merge(Matrix_both,by="variable")%>%
+  mutate(new_cluster = ifelse((`18`%in%c("1")&cohort=="CPTAG")|
+                                (`18`%in%c("1")&cohort=="JHU"),"Immune-hot","Immune-cold"),
+         new_cluster = ifelse((`18`%in%c("2")&cohort=="CPTAG")|
+                            (`18`%in%c("2")&cohort=="JHU"),"Immune-active",new_cluster)%>%
+           factor(levels = c("Immune-hot","Immune-active","Immune-cold")))%>%
+  mutate(all_cluster = ifelse(cohort =="JHU",paste("C",`18`+3,sep = ""),paste("C",`18`,sep = ""))%>%
+         factor(levels = paste("C",1:6,sep = "")))
+
+# T-rich vs cold
+Hot_vs_cold_sample = protein_exp%>%
+  mutate(new_cluster = ifelse((`18`%in%c("1")&cohort=="CPTAG")|
+                                (`18`%in%c("1")&cohort=="JHU"),"Immune-hot","Immune-cold"),
+         new_cluster = ifelse((`18`%in%c("2")&cohort=="CPTAG")|
+                            (`18`%in%c("2")&cohort=="JHU"),"Immune-active",new_cluster)%>%
+           factor(levels = c("Immune-hot","Immune-active","Immune-cold")))%>%
+  dplyr::select(variable,new_cluster,cohort)%>%
+  unique()%>%
+  dplyr::filter(cohort=="CPTAG"&new_cluster%in%c("Immune-hot","Immune-cold"))
+
+normal_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-cold",]$variable)
+group_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-hot",]$variable)
+
+mat = Protein_DDA_raw%>%
+  mutate(name = paste(Index,geneSymbol,sep = "__"))%>%
+  column_to_rownames("name")
+mat = mat[,c(normal_samples,group_samples)]
+
+
+res <- t(apply(mat, 1, function(x) {
+    normal_values <- as.numeric(x[normal_samples])
+    group_values <- as.numeric(x[group_samples])
+    normal_values <- normal_values[!is.na(normal_values)]
+    group_values <- group_values[!is.na(group_values)]
+    if (length(normal_values) < 4 || length(group_values) < 4) {
+      return(c(
+        logFC = NA_real_, p = NA_real_, normal_median = NA_real_, group_median = NA_real_,
+        n_normal = length(normal_values), n_group = length(group_values), pct_group_gt_normal_median = NA_real_
+      ))
+    }
+    normal_median <- median(normal_values)
+    group_median <- median(group_values)
+    p_value <- suppressWarnings(wilcox.test(group_values, normal_values, exact = FALSE)$p.value)
+    c(
+      logFC = group_median - normal_median,
+      p = p_value,
+      normal_median = normal_median,
+      group_median = group_median,
+      n_normal = length(normal_values),
+      n_group = length(group_values),
+      pct_group_gt_normal_median = mean(group_values > normal_median)
+    )
+  }))
+
+
+Hot_vs_cold_all_CPTAC_DDA =  as.data.frame(res) %>%
+    tibble::rownames_to_column("name") %>%
+    drop_na()%>%
+    dplyr::mutate(FDR = p.adjust(p, method = "BH")) %>%
+    separate(name,into = c("Index","gene"),sep = "__")%>%
+    dplyr::arrange(p)%>%
+  mutate(sig = ifelse(FDR<0.05,"DEG","Others"))
+
+ggplot(Hot_vs_cold_all_CPTAC_DDA,aes(x=logFC,y= -log10(FDR),color=sig))+
+  geom_point(size=1,alpha=0.5)+
+  geom_point(data=Hot_vs_cold_all_CPTAC_DDA%>%
+               dplyr::filter(sig=="DEG"),alpha=0.8)+
+  geom_vline(xintercept = 0,linetype="dashed")+
+  theme_bw()+
+  scale_color_manual(values = c("red","grey"))+
+  xlab("logFC T-rich vs Immune-cold")+
+  ylab("-log FDR")+
+  theme(axis.text = element_text(size=11,color="black"))+
+  scale_x_continuous(limits = c(-1.5,1.5),breaks = c(-1,0,1))+
+  scale_y_continuous(limits = c(0,5),breaks = c(0,2,4))+
+  geom_text_repel(data=Hot_vs_cold_all_CPTAC_DDA%>%
+               dplyr::filter(sig=="DEG"),aes(label=gene),max.overlaps = 10)
+
+write.csv(Hot_vs_cold_all_CPTAC_DDA,"./Manuscript/Figure2/SupTable/Fig2B_TvsCold_DDA.csv")
+
+# Macro vs cold
+Hot_vs_cold_sample = protein_exp%>%
+  mutate(new_cluster = ifelse((`18`%in%c("1")&cohort=="CPTAG")|
+                                (`18`%in%c("1")&cohort=="JHU"),"Immune-hot","Immune-cold"),
+         new_cluster = ifelse((`18`%in%c("2")&cohort=="CPTAG")|
+                            (`18`%in%c("2")&cohort=="JHU"),"Immune-active",new_cluster)%>%
+           factor(levels = c("Immune-hot","Immune-active","Immune-cold")))%>%
+  dplyr::select(variable,new_cluster,cohort)%>%
+  unique()%>%
+  dplyr::filter(cohort=="CPTAG"&new_cluster%in%c("Immune-active","Immune-cold"))
+
+normal_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-cold",]$variable)
+group_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-active",]$variable)
+
+mat = Protein_DDA_raw%>%
+  mutate(name = paste(Index,geneSymbol,sep = "__"))%>%
+  column_to_rownames("name")
+mat = mat[,c(normal_samples,group_samples)]
+
+
+res <- t(apply(mat, 1, function(x) {
+    normal_values <- as.numeric(x[normal_samples])
+    group_values <- as.numeric(x[group_samples])
+    normal_values <- normal_values[!is.na(normal_values)]
+    group_values <- group_values[!is.na(group_values)]
+    if (length(normal_values) < 4 || length(group_values) < 4) {
+      return(c(
+        logFC = NA_real_, p = NA_real_, normal_median = NA_real_, group_median = NA_real_,
+        n_normal = length(normal_values), n_group = length(group_values), pct_group_gt_normal_median = NA_real_
+      ))
+    }
+    normal_median <- median(normal_values)
+    group_median <- median(group_values)
+    p_value <- suppressWarnings(wilcox.test(group_values, normal_values, exact = FALSE)$p.value)
+    c(
+      logFC = group_median - normal_median,
+      p = p_value,
+      normal_median = normal_median,
+      group_median = group_median,
+      n_normal = length(normal_values),
+      n_group = length(group_values),
+      pct_group_gt_normal_median = mean(group_values > normal_median)
+    )
+  }))
+
+
+Hot_vs_cold_all_CPTAC_DDA =  as.data.frame(res) %>%
+    tibble::rownames_to_column("name") %>%
+    drop_na()%>%
+    dplyr::mutate(FDR = p.adjust(p, method = "BH")) %>%
+    separate(name,into = c("Index","gene"),sep = "__")%>%
+    dplyr::arrange(p)%>%
+  mutate(sig = ifelse(FDR<0.05,"DEG","Others"))
+
+write.csv(Hot_vs_cold_all_CPTAC_DDA,"./Manuscript/Figure2/SupTable/Fig2B_MacrovsCold_DDA.csv")
+
+ggplot(Hot_vs_cold_all_CPTAC_DDA,aes(x=logFC,y= -log10(FDR),color=sig))+
+  geom_point(size=1,alpha=0.5)+
+  geom_point(data=Hot_vs_cold_all_CPTAC_DDA%>%
+               dplyr::filter(sig=="DEG"),alpha=0.8)+
+  geom_vline(xintercept = 0,linetype="dashed")+
+  theme_bw()+
+  scale_color_manual(values = c("red","grey"))+
+  xlab("logFC T-rich vs Immune-cold")+
+  ylab("-log FDR")+
+  theme(axis.text = element_text(size=11,color="black"))+
+  scale_x_continuous(limits = c(-1.5,1.5),breaks = c(-1,0,1))+
+  scale_y_continuous(limits = c(0,5.5),breaks = c(0,2,4))+
+  geom_text_repel(data=Hot_vs_cold_all_CPTAC_DDA%>%
+               dplyr::filter(sig=="DEG"),aes(label=gene),max.overlaps = 10)
+
+```
+
+### DDA JHU
+
+```{r}
+
+Hot_vs_cold_sample = protein_exp%>%
+  mutate(new_cluster = ifelse((`18`%in%c("1")&cohort=="CPTAG")|
+                                (`18`%in%c("1")&cohort=="JHU"),"Immune-hot","Immune-cold"),
+         new_cluster = ifelse((`18`%in%c("2")&cohort=="CPTAG")|
+                            (`18`%in%c("2")&cohort=="JHU"),"Immune-active",new_cluster)%>%
+           factor(levels = c("Immune-hot","Immune-active","Immune-cold")))%>%
+  dplyr::select(variable,new_cluster,cohort)%>%
+  unique()%>%
+  dplyr::filter(cohort=="JHU"&new_cluster%in%c("Immune-hot","Immune-cold"))
+
+
+normal_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-cold",]$variable)
+group_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-hot",]$variable)
+
+mat = Protein_DDA_raw_JHU%>%
+  mutate(name = paste(Index,geneSymbol,sep = "__"))%>%
+  column_to_rownames("name")
+mat = mat[,c(normal_samples,group_samples)]
+
+
+res <- t(apply(mat, 1, function(x) {
+    normal_values <- as.numeric(x[normal_samples])
+    group_values <- as.numeric(x[group_samples])
+    normal_values <- normal_values[!is.na(normal_values)]
+    group_values <- group_values[!is.na(group_values)]
+    if (length(normal_values) < 4 || length(group_values) < 4) {
+      return(c(
+        logFC = NA_real_, p = NA_real_, normal_median = NA_real_, group_median = NA_real_,
+        n_normal = length(normal_values), n_group = length(group_values), pct_group_gt_normal_median = NA_real_
+      ))
+    }
+    normal_median <- median(normal_values)
+    group_median <- median(group_values)
+    p_value <- suppressWarnings(wilcox.test(group_values, normal_values, exact = FALSE)$p.value)
+    c(
+      logFC = group_median - normal_median,
+      p = p_value,
+      normal_median = normal_median,
+      group_median = group_median,
+      n_normal = length(normal_values),
+      n_group = length(group_values),
+      pct_group_gt_normal_median = mean(group_values > normal_median)
+    )
+  }))
+
+
+Hot_vs_cold_all_JHU_DDA =  as.data.frame(res) %>%
+    tibble::rownames_to_column("name") %>%
+    drop_na()%>%
+    dplyr::mutate(FDR = p.adjust(p, method = "BH")) %>%
+    separate(name,into = c("Index","gene"),sep = "__")%>%
+    dplyr::arrange(p)%>%
+  mutate(sig = ifelse(FDR<0.05,"DEG","Others"))
+
+ggplot(Hot_vs_cold_all_JHU_DDA,aes(x=logFC,y= -log10(p),color=sig))+
+  geom_point(size=1,alpha=0.5)+
+  geom_point(data=Hot_vs_cold_all_JHU_DDA%>%
+               dplyr::filter(sig=="DEG"),alpha=0.8)+
+  geom_vline(xintercept = 0,linetype="dashed")+
+  theme_bw()+
+  scale_color_manual(values = c("grey"))+
+  xlab("logFC T-rich vs Immune-cold")+
+  ylab("-log p value")+
+  theme(axis.text = element_text(size=11,color="black"))+
+  #scale_x_continuous(limits = c(-1.5,1.5),breaks = c(-1,0,1))+
+  scale_y_continuous(limits = c(0,3),breaks = c(0,2))+
+  geom_text_repel(data=Hot_vs_cold_all_JHU_DDA%>%
+               dplyr::filter(-log10(p) > 1.5 | abs(logFC)>1),aes(label=gene),max.overlaps = 10)
+
+write.csv(Hot_vs_cold_all_JHU_DDA,"./Manuscript/Figure2/SupTable/Fig2B_TvsCold_DDA-JHU.csv")
+
+# Macro vs cold
+Hot_vs_cold_sample = protein_exp%>%
+  mutate(new_cluster = ifelse((`18`%in%c("1")&cohort=="CPTAG")|
+                                (`18`%in%c("1")&cohort=="JHU"),"Immune-hot","Immune-cold"),
+         new_cluster = ifelse((`18`%in%c("2")&cohort=="CPTAG")|
+                            (`18`%in%c("2")&cohort=="JHU"),"Immune-active",new_cluster)%>%
+           factor(levels = c("Immune-hot","Immune-active","Immune-cold")))%>%
+  dplyr::select(variable,new_cluster,cohort)%>%
+  unique()%>%
+  dplyr::filter(cohort=="JHU"&new_cluster%in%c("Immune-active","Immune-cold"))
+
+normal_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-cold",]$variable)
+group_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-active",]$variable)
+
+mat = Protein_DDA_raw_JHU%>%
+  mutate(name = paste(Index,geneSymbol,sep = "__"))%>%
+  column_to_rownames("name")
+mat = mat[,c(normal_samples,group_samples)]
+
+
+res <- t(apply(mat, 1, function(x) {
+    normal_values <- as.numeric(x[normal_samples])
+    group_values <- as.numeric(x[group_samples])
+    normal_values <- normal_values[!is.na(normal_values)]
+    group_values <- group_values[!is.na(group_values)]
+    if (length(normal_values) < 4 || length(group_values) < 4) {
+      return(c(
+        logFC = NA_real_, p = NA_real_, normal_median = NA_real_, group_median = NA_real_,
+        n_normal = length(normal_values), n_group = length(group_values), pct_group_gt_normal_median = NA_real_
+      ))
+    }
+    normal_median <- median(normal_values)
+    group_median <- median(group_values)
+    p_value <- suppressWarnings(wilcox.test(group_values, normal_values, exact = FALSE)$p.value)
+    c(
+      logFC = group_median - normal_median,
+      p = p_value,
+      normal_median = normal_median,
+      group_median = group_median,
+      n_normal = length(normal_values),
+      n_group = length(group_values),
+      pct_group_gt_normal_median = mean(group_values > normal_median)
+    )
+  }))
+
+
+Hot_vs_cold_all_CPTAC_DDA =  as.data.frame(res) %>%
+    tibble::rownames_to_column("name") %>%
+    drop_na()%>%
+    dplyr::mutate(FDR = p.adjust(p, method = "BH")) %>%
+    separate(name,into = c("Index","gene"),sep = "__")%>%
+    dplyr::arrange(p)%>%
+  mutate(sig = ifelse(FDR<0.05,"DEG","Others"))
+
+write.csv(Hot_vs_cold_all_CPTAC_DDA,"./Manuscript/Figure2/SupTable/Fig2B_MacrovsCold_DDA-JHU.csv")
+
+
+
+```
+
+### pSY CPTAC
+
+```{r}
+
+Hot_vs_cold_sample = protein_exp%>%
+  mutate(new_cluster = ifelse((`18`%in%c("1")&cohort=="CPTAG")|
+                                (`18`%in%c("1")&cohort=="JHU"),"Immune-hot","Immune-cold"),
+         new_cluster = ifelse((`18`%in%c("2")&cohort=="CPTAG")|
+                            (`18`%in%c("2")&cohort=="JHU"),"Immune-active",new_cluster)%>%
+           factor(levels = c("Immune-hot","Immune-active","Immune-cold")))%>%
+  dplyr::select(variable,new_cluster,cohort)%>%
+  unique()%>%
+  dplyr::filter(cohort=="CPTAG"&new_cluster%in%c("Immune-hot","Immune-cold"))
+
+
+normal_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-cold",]$variable)
+group_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-hot",]$variable)
+
+Phospho_raw_new = rbind(Phospho_raw,pY_raw)
+
+mat = Phospho_raw_new%>%
+  mutate(name = paste(Index,gene_site,sep = "__"))%>%
+  column_to_rownames("name")
+mat = mat[,c(normal_samples,group_samples)]
+res <- t(apply(mat, 1, function(x) {
+    normal_values <- as.numeric(x[normal_samples])
+    group_values <- as.numeric(x[group_samples])
+    normal_values <- normal_values[!is.na(normal_values)]
+    group_values <- group_values[!is.na(group_values)]
+    if (length(normal_values) < 4 || length(group_values) < 4) {
+      return(c(
+        logFC = NA_real_, p = NA_real_, normal_median = NA_real_, group_median = NA_real_,
+        n_normal = length(normal_values), n_group = length(group_values), pct_group_gt_normal_median = NA_real_
+      ))
+    }
+    normal_median <- median(normal_values)
+    group_median <- median(group_values)
+    p_value <- suppressWarnings(wilcox.test(group_values, normal_values, exact = FALSE)$p.value)
+    c(
+      logFC = group_median - normal_median,
+      p = p_value,
+      normal_median = normal_median,
+      group_median = group_median,
+      n_normal = length(normal_values),
+      n_group = length(group_values),
+      pct_group_gt_normal_median = mean(group_values > normal_median)
+    )
+  }))
+
+
+Hot_vs_cold_pST_CPTAC =  as.data.frame(res) %>%
+    tibble::rownames_to_column("name") %>%
+    drop_na()%>%
+    dplyr::mutate(FDR = p.adjust(p, method = "BH")) %>%
+    separate(name,into = c("Index","gene_site"),sep = "__")%>%
+    dplyr::arrange(p)%>%
+  mutate(sig = ifelse(FDR<0.05,"DEG","Others"))
+
+
+
+ggplot(Hot_vs_cold_pST_CPTAC,aes(x=logFC,y= -log10(FDR),color=sig))+
+  geom_point(size=1,alpha=0.5)+
+  geom_point(data=Hot_vs_cold_pST_CPTAC%>%
+               dplyr::filter(sig=="DEG"),alpha=0.8)+
+  geom_vline(xintercept = 0,linetype="dashed")+
+  theme_bw()+
+  scale_color_manual(values = c("red","grey"))+
+  xlab("logFC T-rich vs Immune-cold")+
+  ylab("-log FDR")+
+  theme(axis.text = element_text(size=11,color="black"))+
+  scale_x_continuous(limits = c(-2.5,2.5),breaks = c(-2,0,2))+
+  scale_y_continuous(limits = c(0,3.7))+
+  geom_text_repel(data=Hot_vs_cold_pST_CPTAC%>%
+               dplyr::filter(sig=="DEG"),aes(label=gene_site))
+
+write.csv(Hot_vs_cold_pST_CPTAC,"./Manuscript/Figure2/SupTable/Fig2C_TvsCold_pST.csv")
+
+# Macro-rich vs cold
+
+Hot_vs_cold_sample = protein_exp%>%
+  mutate(new_cluster = ifelse((`18`%in%c("1")&cohort=="CPTAG")|
+                                (`18`%in%c("1")&cohort=="JHU"),"Immune-hot","Immune-cold"),
+         new_cluster = ifelse((`18`%in%c("2")&cohort=="CPTAG")|
+                            (`18`%in%c("2")&cohort=="JHU"),"Immune-active",new_cluster)%>%
+           factor(levels = c("Immune-hot","Immune-active","Immune-cold")))%>%
+  dplyr::select(variable,new_cluster,cohort)%>%
+  unique()%>%
+  dplyr::filter(cohort=="CPTAG"&new_cluster%in%c("Immune-active","Immune-cold"))
+
+
+normal_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-cold",]$variable)
+group_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-active",]$variable)
+
+mat = Phospho_raw_new%>%
+  mutate(name = paste(Index,gene_site,sep = "__"))%>%
+  column_to_rownames("name")
+mat = mat[,c(normal_samples,group_samples)]
+res <- t(apply(mat, 1, function(x) {
+    normal_values <- as.numeric(x[normal_samples])
+    group_values <- as.numeric(x[group_samples])
+    normal_values <- normal_values[!is.na(normal_values)]
+    group_values <- group_values[!is.na(group_values)]
+    if (length(normal_values) < 4 || length(group_values) < 4) {
+      return(c(
+        logFC = NA_real_, p = NA_real_, normal_median = NA_real_, group_median = NA_real_,
+        n_normal = length(normal_values), n_group = length(group_values), pct_group_gt_normal_median = NA_real_
+      ))
+    }
+    normal_median <- median(normal_values)
+    group_median <- median(group_values)
+    p_value <- suppressWarnings(wilcox.test(group_values, normal_values, exact = FALSE)$p.value)
+    c(
+      logFC = group_median - normal_median,
+      p = p_value,
+      normal_median = normal_median,
+      group_median = group_median,
+      n_normal = length(normal_values),
+      n_group = length(group_values),
+      pct_group_gt_normal_median = mean(group_values > normal_median)
+    )
+  }))
+
+
+Hot_vs_cold_pST_CPTAC =  as.data.frame(res) %>%
+    tibble::rownames_to_column("name") %>%
+    drop_na()%>%
+    dplyr::mutate(FDR = p.adjust(p, method = "BH")) %>%
+    separate(name,into = c("Index","gene_site"),sep = "__")%>%
+    dplyr::arrange(p)%>%
+  mutate(sig = ifelse(FDR<0.05,"DEG","Others"))
+
+write.csv(Hot_vs_cold_pST_CPTAC,"./Manuscript/Figure2/SupTable/Fig2F_MacrovsCold_pST.csv")
+
+
+ggplot(Hot_vs_cold_pST_CPTAC,aes(x=logFC,y= -log10(FDR),color=sig))+
+  geom_point(size=1,alpha=0.5)+
+  geom_point(data=Hot_vs_cold_pST_CPTAC%>%
+               dplyr::filter(sig=="DEG"),alpha=0.8)+
+  geom_vline(xintercept = 0,linetype="dashed")+
+  theme_bw()+
+  scale_color_manual(values = c("red","grey"))+
+  xlab("logFC T-rich vs Immune-cold")+
+  ylab("-log FDR")+
+  theme(axis.text = element_text(size=11,color="black"))+
+  scale_x_continuous(limits = c(-2.8,2.8),breaks = c(-2,0,2))+
+  scale_y_continuous(limits = c(0,5.2),breaks = c(0,2,4))+
+  geom_text_repel(data=Hot_vs_cold_pST_CPTAC%>%
+               dplyr::filter(sig=="DEG"),aes(label=gene_site))
+
+```
+
+
+### pST JHU
+
+```{r}
+
+Hot_vs_cold_sample = protein_exp%>%
+  mutate(new_cluster = ifelse((`18`%in%c("1")&cohort=="CPTAG")|
+                                (`18`%in%c("1")&cohort=="JHU"),"Immune-hot","Immune-cold"),
+         new_cluster = ifelse((`18`%in%c("2")&cohort=="CPTAG")|
+                            (`18`%in%c("2")&cohort=="JHU"),"Immune-active",new_cluster)%>%
+           factor(levels = c("Immune-hot","Immune-active","Immune-cold")))%>%
+  dplyr::select(variable,new_cluster,cohort)%>%
+  unique()%>%
+  dplyr::filter(cohort=="JHU"&new_cluster%in%c("Immune-hot","Immune-cold"))
+
+
+normal_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-cold",]$variable)
+group_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-hot",]$variable)
+
+mat = Phospho_raw_JHU%>%
+  mutate(name = paste(Index,gene_site,sep = "__"))%>%
+  column_to_rownames("name")
+mat = mat[,c(normal_samples,group_samples)]
+res <- t(apply(mat, 1, function(x) {
+    normal_values <- as.numeric(x[normal_samples])
+    group_values <- as.numeric(x[group_samples])
+    normal_values <- normal_values[!is.na(normal_values)]
+    group_values <- group_values[!is.na(group_values)]
+    if (length(normal_values) < 4 || length(group_values) < 4) {
+      return(c(
+        logFC = NA_real_, p = NA_real_, normal_median = NA_real_, group_median = NA_real_,
+        n_normal = length(normal_values), n_group = length(group_values), pct_group_gt_normal_median = NA_real_
+      ))
+    }
+    normal_median <- median(normal_values)
+    group_median <- median(group_values)
+    p_value <- suppressWarnings(wilcox.test(group_values, normal_values, exact = FALSE)$p.value)
+    c(
+      logFC = group_median - normal_median,
+      p = p_value,
+      normal_median = normal_median,
+      group_median = group_median,
+      n_normal = length(normal_values),
+      n_group = length(group_values),
+      pct_group_gt_normal_median = mean(group_values > normal_median)
+    )
+  }))
+
+
+Hot_vs_cold_pST_JHU =  as.data.frame(res) %>%
+    tibble::rownames_to_column("name") %>%
+    drop_na()%>%
+    dplyr::mutate(FDR = p.adjust(p, method = "BH")) %>%
+    separate(name,into = c("Index","gene_site"),sep = "__")%>%
+    dplyr::arrange(p)%>%
+  mutate(sig = ifelse(FDR<0.05,"DEG","Others"))
+
+write.csv(Hot_vs_cold_pST_JHU,"./Manuscript/Figure2/SupTable/Fig2C_TrichvsCold_pST-JHU.csv")
+
+
+ggplot(Hot_vs_cold_pST_JHU,aes(x=logFC,y= -log10(p),color=sig))+
+  geom_point(size=1,alpha=0.5)+
+  geom_point(data=Hot_vs_cold_pST_JHU%>%
+               dplyr::filter(sig=="DEG"),alpha=0.8)+
+  geom_vline(xintercept = 0,linetype="dashed")+
+  theme_bw()+
+  scale_color_manual(values = c("grey"))+
+  xlab("logFC T-rich vs Immune-cold")+
+  ylab("-log FDR")+
+  theme(axis.text = element_text(size=11,color="black"))+
+  scale_x_continuous(limits = c(-3,3),breaks = c(-2,0,2))+
+  scale_y_continuous(limits = c(0,3))+
+  geom_text_repel(data=Hot_vs_cold_pST_JHU%>%
+               dplyr::filter(sig=="DEG"),aes(label=gene_site))
+
+# Macro
+
+
+Hot_vs_cold_sample = protein_exp%>%
+  mutate(new_cluster = ifelse((`18`%in%c("1")&cohort=="CPTAG")|
+                                (`18`%in%c("1")&cohort=="JHU"),"Immune-hot","Immune-cold"),
+         new_cluster = ifelse((`18`%in%c("2")&cohort=="CPTAG")|
+                            (`18`%in%c("2")&cohort=="JHU"),"Immune-active",new_cluster)%>%
+           factor(levels = c("Immune-hot","Immune-active","Immune-cold")))%>%
+  dplyr::select(variable,new_cluster,cohort)%>%
+  unique()%>%
+  dplyr::filter(cohort=="JHU"&new_cluster%in%c("Immune-active","Immune-cold"))
+
+
+normal_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-cold",]$variable)
+group_samples <- as.character(Hot_vs_cold_sample[Hot_vs_cold_sample$new_cluster=="Immune-active",]$variable)
+
+mat = Phospho_raw_JHU%>%
+  mutate(name = paste(Index,gene_site,sep = "__"))%>%
+  column_to_rownames("name")
+mat = mat[,c(normal_samples,group_samples)]
+res <- t(apply(mat, 1, function(x) {
+    normal_values <- as.numeric(x[normal_samples])
+    group_values <- as.numeric(x[group_samples])
+    normal_values <- normal_values[!is.na(normal_values)]
+    group_values <- group_values[!is.na(group_values)]
+    if (length(normal_values) < 4 || length(group_values) < 4) {
+      return(c(
+        logFC = NA_real_, p = NA_real_, normal_median = NA_real_, group_median = NA_real_,
+        n_normal = length(normal_values), n_group = length(group_values), pct_group_gt_normal_median = NA_real_
+      ))
+    }
+    normal_median <- median(normal_values)
+    group_median <- median(group_values)
+    p_value <- suppressWarnings(wilcox.test(group_values, normal_values, exact = FALSE)$p.value)
+    c(
+      logFC = group_median - normal_median,
+      p = p_value,
+      normal_median = normal_median,
+      group_median = group_median,
+      n_normal = length(normal_values),
+      n_group = length(group_values),
+      pct_group_gt_normal_median = mean(group_values > normal_median)
+    )
+  }))
+
+
+Hot_vs_cold_pST_JHU =  as.data.frame(res) %>%
+    tibble::rownames_to_column("name") %>%
+    drop_na()%>%
+    dplyr::mutate(FDR = p.adjust(p, method = "BH")) %>%
+    separate(name,into = c("Index","gene_site"),sep = "__")%>%
+    dplyr::arrange(p)%>%
+  mutate(sig = ifelse(FDR<0.05,"DEG","Others"))
+
+write.csv(Hot_vs_cold_pST_JHU,"./Manuscript/Figure2/SupTable/Fig2F_MacrovsCold_pST-JHU.csv")
+
+
+ggplot(Hot_vs_cold_pST_JHU,aes(x=logFC,y= -log10(p),color=sig))+
+  geom_point(size=1,alpha=0.5)+
+  geom_point(data=Hot_vs_cold_pST_JHU%>%
+               dplyr::filter(sig=="DEG"),alpha=0.8)+
+  geom_vline(xintercept = 0,linetype="dashed")+
+  theme_bw()+
+  scale_color_manual(values = c("grey"))+
+  xlab("logFC T-rich vs Immune-cold")+
+  ylab("-log FDR")+
+  theme(axis.text = element_text(size=11,color="black"))+
+  scale_x_continuous(limits = c(-3,3),breaks = c(-2,0,2))+
+  scale_y_continuous(limits = c(0,3))+
+  geom_text_repel(data=Hot_vs_cold_pST_JHU%>%
+               dplyr::filter(sig=="DEG"),aes(label=gene_site))
+
+```
+
+#Fig2H
+
+#Fig 2I
+
+#Fig 2J
+
+#Fig 2K
+
+# SupFi1
+
+
+
+
+
