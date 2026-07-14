@@ -1,0 +1,15 @@
+.DS_Store
+
+# Reference datasets are hosted on Zenodo, not committed to git.
+Code/Deconvolution_reference/
+Code/Deconvolution_reference.zip
+
+# Local analysis outputs and caches.
+*.RData
+*.Rhistory
+*.rds
+*.html
+*.pdf
+*.png
+*_cache/
+*_files/

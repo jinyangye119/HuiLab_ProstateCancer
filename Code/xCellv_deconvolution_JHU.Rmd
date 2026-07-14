@@ -12,9 +12,6 @@ This notebook builds a custom xCell2 reference from `dge_combined_annotated.rds`
 
 The input object is a Seurat single-cell object. To make a stable custom reference for bulk RNA-seq deconvolution, this workflow creates pseudo-bulk reference profiles by averaging expression within each `refinedID` cell type and each source sample/dataset.
 
-Reference single-cell: https://www.nature.com/articles/s41467-021-27322-4
-Reference rds file:
-
 ## Setup
 
 ```{r setup, message=FALSE, warning=FALSE}
@@ -30,8 +27,8 @@ suppressPackageStartupMessages({
 })
 
 cfg <- list(
-  seurat_rds = "/Users/YUC199/Library/CloudStorage/OneDrive-JohnsHopkins/Personal_data/Post-doc/Qian Lab JHU/Zhang Hui Lab/Hongyi/Manuscript/Code/xCell_reference/dge_combined_annotated.rds",
-  output_dir = "/Users/YUC199/Library/CloudStorage/OneDrive-JohnsHopkins/Personal_data/Post-doc/Qian Lab JHU/Zhang Hui Lab/Hongyi/Manuscript/Code/xCell_reference/xCell2_custom_reference_tpm",
+  seurat_rds = "/Users/YUC199/Library/CloudStorage/OneDrive-JohnsHopkins/Personal_data/Post-doc/Qian Lab JHU/Zhang Hui Lab/Hongyi/raw/dge_combined_annotated.rds",
+  output_dir = "/Users/YUC199/Library/CloudStorage/OneDrive-JohnsHopkins/Personal_data/Post-doc/Qian Lab JHU/Zhang Hui Lab/Hongyi/raw/xCell2_JHU",
   assay = "RNA",
   expression_slot = "counts",
   celltype_col = "refinedID",
@@ -102,13 +99,11 @@ set.seed(cfg$seed)
 
 ```{r load-reference}
 ref_seurat <- readRDS(cfg$seurat_rds)
-View(ref_seurat@meta.data)
 stopifnot(inherits(ref_seurat, "Seurat"))
 stopifnot(cfg$assay %in% names(ref_seurat@assays))
 stopifnot(all(c(cfg$celltype_col, cfg$dataset_col) %in% colnames(ref_seurat@meta.data)))
 
 Idents(ref_seurat) <- merge_reference_label(ref_seurat[[cfg$celltype_col, drop = TRUE]])
-#Idents(ref_seurat) <- cfg$celltype_col
 
 celltype_counts <- sort(table(merge_reference_label(ref_seurat[[cfg$celltype_col, drop = TRUE]])), decreasing = TRUE)
 write.table(
@@ -242,7 +237,6 @@ The xCell2 labels table must include:
 Ontology IDs are assigned only where the mapping is clear. Prostate cancer epithelial labels are intentionally left as `NA` because they are disease-state labels rather than standard normal cell ontology classes.
 
 ```{r labels}
-
 ontology_map <- c(
   "B-cell" = "CL:0000236",
   "Plasma" = "CL:0000786",
@@ -293,6 +287,27 @@ write.table(
 table(labels$label)
 ```
 
+## Optional Lineage File
+
+This creates a lineage dependency file from available Cell Ontology IDs. You can inspect and manually edit the TSV before training if needed. Labels with `NA` ontology will be retained, but they will not contribute ontology relationships.
+
+```{r lineage}
+lineage_file <- file.path(cfg$output_dir, "prostate_xcell2_lineage_dependencies.tsv")
+lineage_result <- tryCatch(
+  xCell2GetLineage(labels = labels[, c("ont", "label", "sample", "dataset")], outFile = lineage_file),
+  error = function(e) {
+    message("Lineage generation failed; training will continue without lineage file: ", conditionMessage(e))
+    NULL
+  }
+)
+
+if (file.exists(lineage_file)) {
+  lineage_file
+} else {
+  NA_character_
+}
+```
+
 ## Train xCell2 Custom Reference
 
 ```{r train-xcell2-reference}
@@ -304,12 +319,14 @@ parallel_param <- if (.Platform$OS.type == "unix" && cfg$workers > 1) {
 
 set.seed(cfg$seed)
 
+lineage_arg <- if (file.exists(lineage_file)) lineage_file else NULL
 
 prostate_xcell2_ref <- xCell2Train(
   ref = ref_matrix,
   labels = labels[, c("ont", "label", "sample", "dataset")],
   refType = cfg$train_ref_type,
   useOntology = cfg$use_ontology,
+  lineageFile = lineage_arg,
   BPPARAM = parallel_param,
   useSpillover = cfg$use_spillover,
   spilloverAlpha = cfg$spillover_alpha
@@ -340,6 +357,7 @@ summary_lines <- c(
   paste("Labels table:", file.path(cfg$output_dir, "prostate_xcell2_reference_labels.tsv")),
   paste("Expression matrix RDS:", file.path(cfg$output_dir, "prostate_xcell2_pseudobulk_log1p_tpm_matrix.rds")),
   paste("TPM matrix RDS:", file.path(cfg$output_dir, "prostate_xcell2_pseudobulk_tpm_matrix.rds")),
+  paste("Lineage file:", ifelse(file.exists(lineage_file), lineage_file, "not generated")),
   "",
   "## Cell Type Counts",
   capture.output(print(table(labels$label)))
@@ -379,20 +397,20 @@ library(xCell2)
 library(readxl)
 library(tidyverse)
 
-tpm = read_excel("../Output/CPTAC_RNAseq_log2TPM.xlsx")%>%
-  dplyr::filter(!is.na(gene_name.T))%>%
-  dplyr::select(gene_name.T,contains("C3"),contains("CHTN"))%>% 
-  group_by(gene_name.T) %>%
+tpm = read_tsv("../raw/raw/JHU/tpm.tsv")%>%
+  dplyr::filter(!is.na(Gene))%>%
+  group_by(Gene) %>%
   summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
   ungroup()%>%
-  column_to_rownames("gene_name.T")%>%
+  column_to_rownames("Gene")%>%
   as.matrix()
 
-meta = read.csv("../raw/raw/CPTAC/20_MetaData_03_12_2026.csv")
+meta = read_xlsx("../raw/raw/JHU/meta_select1-cptac-24-patients-3-11-2026.xlsx")
 
 meta_RNA <- meta %>%
-  filter(common_ID %in% colnames(tpm)) %>%
-  column_to_rownames("common_ID")
+  filter(sampleID %in% colnames(tpm)) %>%
+  column_to_rownames("sampleID") %>%
+  dplyr::arrange(Type)
 
 prostate_xcell2_ref = read_rds("/Users/YUC199/Library/CloudStorage/OneDrive-JohnsHopkins/Personal_data/Post-doc/Qian Lab JHU/Zhang Hui Lab/Hongyi/raw/xCell2_custom_reference_tpm/prostate_custom_xCell2_reference.rds")
 xcell_res <- xCell2Analysis(
@@ -411,31 +429,13 @@ xcell_long = xcell_res%>%
   mutate(Celltype=ifelse(X=="Normal prostate epithelial","Normal Epithelial","Other cells"),
          Celltype=ifelse(X=="Tumor epithelial","Tumor Epithelial",Celltype),
          Celltype=ifelse(X%in%c("CD14+ Monocyte","M2-Macrophage","CD4 T cell","Mast","CD8 T cell","CD14- Monocyte","Myeloid","T-cell","M0-Macrophage" ),"Immune cells",Celltype),
-         Celltype=ifelse(X%in%c("Endothelial","Fibroblast", "Club","Smooth-muscle"  ),"Stromal/Endo cells",Celltype))
+         Celltype=ifelse(X%in%c("Endothelial","Fibroblast", "Club","Smooth-muscle"  ),"Stromal/Endo cells",Celltype))%>%
+  group_by(variable,ptID,Type)%>%
+  mutate(total= sum(value),
+         perc = value/total)%>%
+  ungroup()
 
-df1 <- xcell_long %>% 
-  summarise(med = median(value))
-
-
-ggplot(xcell_long%>%
-         dplyr::filter(Celltype=="Tumor Epithelial")%>%
-         dplyr::select(case_id,value,FirstCategory)%>%
-         unique(),aes(x=FirstCategory,y=value)) +
-  #geom_violin(scale = "width",trim = T)+
-  geom_dotplot(aes( fill = FirstCategory),color=NA,
-                 binaxis = "y",         # which axis to bin along
-                 binwidth = 0.02,        # Minimal difference considered diffeerent
-                 stackdir = "center"    # Centered
-                 )+
-  #geom_point(position = position_jitterdodge(0.6),size=1)+
-  theme_bw()+
-  xlab("")+
-  ylab("Enrichment Score")+
-  theme(axis.text.x = element_blank())+
-  stat_summary(fun.y = median, fun.ymin = median, fun.ymax = median,
-                 geom = "crossbar", width = 0.6)
-
-write.csv(xcell_long,"../Output/xCell2_OutPut.csv")
+write.csv(xcell_long,"../Output/xCell2_OutPut_JHU.csv")
 
 ```
 

@@ -8,7 +8,29 @@ editor_options:
 
 # Library, color and functiosn
 
+
+
 ```{r}
+
+library(data.table)
+library(ggpubr)
+library(edgeR)
+library(tidyverse)
+library(ggplot2)
+library(DESeq2)
+library(openxlsx)
+library(org.Hs.eg.db)
+library(ggrepel)
+library(reshape2)
+library(RColorBrewer)
+library(DEP)
+library(readxl)
+library(matrixStats)
+library(pheatmap)
+library(VennDiagram)
+library(grid)
+library(limma)
+library(AnnotationDbi)
 
 
 Distiguish_color = c(
